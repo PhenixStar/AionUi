@@ -18,7 +18,37 @@ function runPostInstall() {
       // In CI, rebuild native modules specifically for Electron
       console.log(`CI environment detected, rebuilding native modules for Electron ${electronVersion}`);
       
-      const rebuildCmd = `npx electron-rebuild --force --version=${electronVersion} --module-dir . --only "better-sqlite3,bcrypt,node-pty"`;
+      // Rebuild critical modules first
+      const rebuildCmd = `npx electron-rebuild --force --version=${electronVersion} --module-dir . --only "better-sqlite3,bcrypt"`;
+      execSync(rebuildCmd, { 
+        stdio: 'inherit', 
+        env: { 
+          ...process.env, 
+          npm_config_build_from_source: 'true',
+          npm_config_runtime: 'electron',
+          npm_config_target: electronVersion,
+          npm_config_disturl: 'https://electronjs.org/headers'
+        } 
+      });
+      
+      // Try to rebuild node-pty separately with error handling
+      try {
+        const nodePtyRebuildCmd = `npx electron-rebuild --force --version=${electronVersion} --module-dir . --only "node-pty"`;
+        execSync(nodePtyRebuildCmd, { 
+          stdio: 'inherit', 
+          env: { 
+            ...process.env, 
+            npm_config_build_from_source: 'true',
+            npm_config_runtime: 'electron',
+            npm_config_target: electronVersion,
+            npm_config_disturl: 'https://electronjs.org/headers'
+          } 
+        });
+        console.log('node-pty rebuilt successfully');
+      } catch (nodePtyError) {
+        console.warn('node-pty rebuild failed, but continuing:', nodePtyError.message);
+        // Don't fail the entire installation due to node-pty issues
+      }
       execSync(rebuildCmd, { 
         stdio: 'inherit', 
         env: { 
