@@ -5,6 +5,9 @@
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Copy as CopyIcon } from '@icon-park/react';
+import { iconColors } from '@/renderer/theme/colors';
 
 type MenuState = {
   visible: boolean;
@@ -12,6 +15,8 @@ type MenuState = {
   y: number;
   text: string;
 };
+
+type RectLike = { left: number; right: number; top: number; bottom: number };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
@@ -27,18 +32,18 @@ const getInputSelectionText = (target: EventTarget | null): string => {
   return '';
 };
 
-const isRightClickOnSelection = (selection: Selection, x: number, y: number): boolean => {
-  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+const isPointInRects = (rects: RectLike[], x: number, y: number): boolean => {
+  if (!rects.length) return false;
+  return rects.some((rect) => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom);
+};
+
+const getSelectionRects = (selection: Selection | null): RectLike[] => {
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return [];
   try {
     const range = selection.getRangeAt(0);
-    // Use the selection's client rects so we only intercept when the user
-    // actually right-clicks on the highlighted area (not just the same container).
-    const rects = Array.from(range.getClientRects());
-    if (rects.length === 0) return false;
-    return rects.some((rect) => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom);
+    return Array.from(range.getClientRects()).map((r) => ({ left: r.left, right: r.right, top: r.top, bottom: r.bottom }));
   } catch {
-    // If the browser throws (rare edge cases), fall back to allowing.
-    return true;
+    return [];
   }
 };
 
@@ -63,7 +68,9 @@ const copyWithExecCommandFallback = (text: string): boolean => {
 };
 
 const SelectionContextMenu: React.FC = () => {
+  const { t } = useTranslation();
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const lastRightClickRef = useRef<{ at: number; text: string; rects: RectLike[] } | null>(null);
   const [state, setState] = useState<MenuState>({ visible: false, x: 0, y: 0, text: '' });
 
   const close = () => {
@@ -86,20 +93,53 @@ const SelectionContextMenu: React.FC = () => {
   }, [state.x, state.y]);
 
   useEffect(() => {
+    const onMouseDownCapture = (e: MouseEvent) => {
+      if (e.button !== 2) return;
+
+      const selection = window.getSelection();
+      const selectionText = selection?.toString().trim() || '';
+      const inputText = getInputSelectionText(e.target).trim();
+      const text = selectionText || inputText;
+
+      if (!text) {
+        lastRightClickRef.current = null;
+        return;
+      }
+
+      lastRightClickRef.current = {
+        at: Date.now(),
+        text,
+        rects: getSelectionRects(selection),
+      };
+    };
+
     const onContextMenu = (e: MouseEvent) => {
       const selection = window.getSelection();
 
       // Prefer DOM selection.
-      let selectedText = selection?.toString() || '';
-      let shouldIntercept = Boolean(selection && selectedText.trim() && isRightClickOnSelection(selection, e.clientX, e.clientY));
+      let selectedText = selection?.toString().trim() || '';
+      const rects = getSelectionRects(selection);
+      let shouldIntercept = Boolean(selectedText && isPointInRects(rects, e.clientX, e.clientY));
 
       // Fallback: selection inside input/textarea.
       if (!shouldIntercept) {
-        selectedText = getInputSelectionText(e.target);
-        shouldIntercept = Boolean(selectedText.trim());
+        selectedText = getInputSelectionText(e.target).trim();
+        shouldIntercept = Boolean(selectedText);
       }
 
-      selectedText = selectedText.trim();
+      // If the act of right-click collapses selection before `contextmenu` fires,
+      // fall back to the selection captured on right-mouse-down.
+      if (!shouldIntercept) {
+        const last = lastRightClickRef.current;
+        if (last && Date.now() - last.at < 1000) {
+          const lastOk = last.rects.length ? isPointInRects(last.rects, e.clientX, e.clientY) : true;
+          if (lastOk) {
+            selectedText = last.text;
+            shouldIntercept = true;
+          }
+        }
+      }
+
       if (!shouldIntercept || !selectedText) {
         close();
         return;
@@ -133,6 +173,7 @@ const SelectionContextMenu: React.FC = () => {
       if (state.visible) close();
     };
 
+    document.addEventListener('mousedown', onMouseDownCapture, true);
     document.addEventListener('contextmenu', onContextMenu, true);
     document.addEventListener('mousedown', onMouseDown, true);
     document.addEventListener('keydown', onKeyDown, true);
@@ -140,6 +181,7 @@ const SelectionContextMenu: React.FC = () => {
     window.addEventListener('scroll', onScroll, true);
 
     return () => {
+      document.removeEventListener('mousedown', onMouseDownCapture, true);
       document.removeEventListener('contextmenu', onContextMenu, true);
       document.removeEventListener('mousedown', onMouseDown, true);
       document.removeEventListener('keydown', onKeyDown, true);
@@ -166,9 +208,10 @@ const SelectionContextMenu: React.FC = () => {
   if (!state.visible) return null;
 
   return (
-    <div ref={menuRef} style={menuStyle} className='bg-bg-1 border border-border rounded-lg shadow-lg p-4px min-w-160px select-none'>
-      <button type='button' onClick={onCopy} className='w-full text-left px-10px py-8px rd-6px hover:bg-fill-2 text-t-primary text-13px'>
-        Copy
+    <div ref={menuRef} style={menuStyle} className='bg-1 border border-solid border-[color:var(--border-base)] rd-10px shadow-lg min-w-180px select-none overflow-hidden'>
+      <button type='button' onClick={onCopy} className='w-full text-left px-12px py-10px flex items-center gap-10px hover:bg-fill-2 text-[color:var(--color-text-1)] text-13px'>
+        <CopyIcon theme='outline' size='16' fill={iconColors.secondary} />
+        <span className='flex-1'>{t('common.copy', { defaultValue: 'Copy' })}</span>
       </button>
     </div>
   );
