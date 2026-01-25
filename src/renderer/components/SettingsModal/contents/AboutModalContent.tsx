@@ -12,6 +12,7 @@ import { useTranslation } from 'react-i18next';
 import classNames from 'classnames';
 import { useSettingsViewMode } from '../settingsViewContext';
 import packageJson from '../../../../../package.json';
+import { emitter } from '@/renderer/utils/emitter';
 
 const AboutModalContent: React.FC = () => {
   const { t } = useTranslation();
@@ -39,7 +40,7 @@ const AboutModalContent: React.FC = () => {
   };
 
   const checkUpdate = () => {
-    ipcBridge.update.open.emit({ source: 'about' });
+    emitter.emit('update.open', { source: 'about' });
   };
 
   const linkItems = [
