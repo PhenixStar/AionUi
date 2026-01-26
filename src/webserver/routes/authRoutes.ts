@@ -8,7 +8,7 @@ import type { Express, Request, Response } from 'express';
 import { AuthService } from '@/webserver/auth/service/AuthService';
 import { AuthMiddleware } from '@/webserver/auth/middleware/AuthMiddleware';
 import { UserRepository } from '@/webserver/auth/repository/UserRepository';
-import { AUTH_CONFIG } from '../config/constants';
+import { AUTH_CONFIG, getCookieOptions } from '../config/constants';
 import { TokenUtils } from '@/webserver/auth/middleware/TokenMiddleware';
 import { createAppError } from '../middleware/errorHandler';
 import { authRateLimiter, authenticatedActionLimiter, apiRateLimiter } from '../middleware/security';
@@ -64,7 +64,19 @@ const QR_LOGIN_PAGE_HTML = `<!DOCTYPE html>
           container.innerHTML = '<h2 class="success">Login Successful!</h2><p>Redirecting... / 登录成功，正在跳转...</p>';
           setTimeout(function() { window.location.href = '/'; }, 1000);
         } else {
-          container.innerHTML = '<h2 class="error">Login Failed</h2><p>' + (data.error || 'QR code expired or invalid') + '</p><p>二维码已过期或无效，请重新扫描。</p>';
+          // XSS 安全修复：使用 textContent 而非 innerHTML 插入错误消息
+          // XSS Security fix: Use textContent instead of innerHTML for error message
+          var h2 = document.createElement('h2');
+          h2.className = 'error';
+          h2.textContent = 'Login Failed';
+          var p1 = document.createElement('p');
+          p1.textContent = data.error || 'QR code expired or invalid';
+          var p2 = document.createElement('p');
+          p2.textContent = '二维码已过期或无效，请重新扫描。';
+          container.innerHTML = '';
+          container.appendChild(h2);
+          container.appendChild(p1);
+          container.appendChild(p2);
         }
       } catch (e) {
         container.innerHTML = '<h2 class="error">Error</h2><p>Network error. Please try again.</p><p>网络错误，请重试。</p>';
@@ -117,9 +129,10 @@ export function registerAuthRoutes(app: Express): void {
       // Update last login
       UserRepository.updateLastLogin(user.id);
 
-      // Set secure cookie
+      // Set secure cookie（远程模式下启用 secure 标志）
+      // Set secure cookie (enable secure flag in remote mode)
       res.cookie(AUTH_CONFIG.COOKIE.NAME, token, {
-        ...AUTH_CONFIG.COOKIE.OPTIONS,
+        ...getCookieOptions(),
         maxAge: AUTH_CONFIG.TOKEN.COOKIE_MAX_AGE,
       });
 
@@ -144,7 +157,13 @@ export function registerAuthRoutes(app: Express): void {
    */
   // Authenticated endpoints reuse shared limiter keyed by user/IP
   // 已登录接口复用按用户/IP 计数的限流器
-  app.post('/logout', apiRateLimiter, AuthMiddleware.authenticateToken, authenticatedActionLimiter, (_req: Request, res: Response) => {
+  app.post('/logout', apiRateLimiter, AuthMiddleware.authenticateToken, authenticatedActionLimiter, (req: Request, res: Response) => {
+    // 将当前 token 加入黑名单 / Blacklist current token
+    const token = TokenUtils.extractFromRequest(req);
+    if (token) {
+      AuthService.blacklistToken(token);
+    }
+
     res.clearCookie(AUTH_CONFIG.COOKIE.NAME);
     res.json({ success: true, message: 'Logged out successfully' });
   });
@@ -347,8 +366,12 @@ export function registerAuthRoutes(app: Express): void {
         return;
       }
 
+      // 获取客户端 IP（用于本地网络限制验证）
+      // Get client IP (for local network restriction verification)
+      const clientIP = req.ip || req.socket.remoteAddress || '';
+
       // 直接验证 QR token（无需 IPC）/ Verify QR token directly (no IPC)
-      const result = await verifyQRTokenDirect(qrToken);
+      const result = await verifyQRTokenDirect(qrToken, clientIP);
 
       if (!result.success || !result.data) {
         res.status(401).json({
@@ -358,9 +381,10 @@ export function registerAuthRoutes(app: Express): void {
         return;
       }
 
-      // 设置 session cookie / Set session cookie
+      // 设置 session cookie（远程模式下启用 secure 标志）
+      // Set session cookie (enable secure flag in remote mode)
       res.cookie(AUTH_CONFIG.COOKIE.NAME, result.data.sessionToken, {
-        ...AUTH_CONFIG.COOKIE.OPTIONS,
+        ...getCookieOptions(),
         maxAge: AUTH_CONFIG.TOKEN.COOKIE_MAX_AGE,
       });
 

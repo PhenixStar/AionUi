@@ -4,20 +4,21 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Switch, Input, Form, Message, Tooltip } from '@arco-design/web-react';
-import { Copy } from '@icon-park/react';
+import { Copy, Refresh } from '@icon-park/react';
 import { webui, shell, type IWebUIStatus } from '@/common/ipcBridge';
 import AionScrollArea from '@/renderer/components/base/AionScrollArea';
 import AionModal from '@/renderer/components/base/AionModal';
 import { useSettingsViewMode } from '../settingsViewContext';
+import { isElectronDesktop } from '@/renderer/utils/platform';
 
 /**
  * 偏好设置行组件
  * Preference row component
  */
-const PreferenceRow: React.FC<{ label: string; description?: string; extra?: React.ReactNode; children: React.ReactNode }> = ({ label, description, extra, children }) => (
+const PreferenceRow: React.FC<{ label: string; description?: React.ReactNode; extra?: React.ReactNode; children: React.ReactNode }> = ({ label, description, extra, children }) => (
   <div className='flex items-center justify-between gap-24px py-12px'>
     <div className='flex-1'>
       <div className='flex items-center gap-8px'>
@@ -34,16 +35,18 @@ const PreferenceRow: React.FC<{ label: string; description?: string; extra?: Rea
  * 信息行组件（用于登录信息展示）
  * Info row component (for login info display)
  */
-const InfoRow: React.FC<{ label: string; value: string; onCopy: () => void }> = ({ label, value, onCopy }) => (
+const InfoRow: React.FC<{ label: string; value: string; onCopy?: () => void; showCopy?: boolean }> = ({ label, value, onCopy, showCopy = true }) => (
   <div className='flex items-center justify-between py-12px'>
     <span className='text-14px text-t-secondary'>{label}</span>
     <div className='flex items-center gap-8px'>
       <span className='text-14px text-t-primary'>{value}</span>
-      <Tooltip content='复制'>
-        <button className='p-4px bg-transparent border-none text-t-tertiary hover:text-t-primary cursor-pointer' onClick={onCopy}>
-          <Copy size={16} />
-        </button>
-      </Tooltip>
+      {showCopy && onCopy && (
+        <Tooltip content='复制'>
+          <button className='p-4px bg-transparent border-none text-t-tertiary hover:text-t-primary cursor-pointer' onClick={onCopy}>
+            <Copy size={16} />
+          </button>
+        </Tooltip>
+      )}
     </div>
   </div>
 );
@@ -57,6 +60,9 @@ const WebuiModalContent: React.FC = () => {
   const viewMode = useSettingsViewMode();
   const isPageMode = viewMode === 'page';
 
+  // 检测是否在 Electron 桌面环境 / Check if running in Electron desktop environment
+  const isDesktop = isElectronDesktop();
+
   const [status, setStatus] = useState<IWebUIStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [startLoading, setStartLoading] = useState(false);
@@ -64,20 +70,28 @@ const WebuiModalContent: React.FC = () => {
   const [allowRemote, setAllowRemote] = useState(false);
   const [cachedIP, setCachedIP] = useState<string | null>(null);
   const [cachedPassword, setCachedPassword] = useState<string | null>(null);
-  const [passwordModalVisible, setPasswordModalVisible] = useState(false);
-  const [passwordLoading, setPasswordLoading] = useState(false);
+  // 标记密码是否可以明文显示（首次启动且未复制过）/ Flag for plaintext password display (first startup and not copied)
+  const [canShowPlainPassword, setCanShowPlainPassword] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
+  // 设置新密码弹窗 / Set new password modal
+  const [setPasswordModalVisible, setSetPasswordModalVisible] = useState(false);
+  const [passwordLoading, setPasswordLoading] = useState(false);
   const [form] = Form.useForm();
-  const [message, messageContext] = Message.useMessage();
-  // 标记重置后是否需要复制密码 / Flag to copy password after reset
-  const copyAfterResetRef = useRef(false);
 
   // 加载状态 / Load status
   const loadStatus = useCallback(async () => {
     setLoading(true);
     try {
-      const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000));
-      const result = await Promise.race([webui.getStatus.invoke(), timeoutPromise]);
+      let result: { success: boolean; data?: IWebUIStatus } | null = null;
+
+      // 优先使用直接 IPC（Electron 环境）/ Prefer direct IPC (Electron environment)
+      if (window.electronAPI?.webuiGetStatus) {
+        result = await window.electronAPI.webuiGetStatus();
+      } else {
+        // 后备方案：使用 bridge / Fallback: use bridge
+        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000));
+        result = await Promise.race([webui.getStatus.invoke(), timeoutPromise]);
+      }
 
       if (result && result.success && result.data) {
         setStatus(result.data);
@@ -86,10 +100,14 @@ const WebuiModalContent: React.FC = () => {
           setCachedIP(result.data.lanIP);
         } else if (result.data.networkUrl) {
           const match = result.data.networkUrl.match(/http:\/\/([^:]+):/);
-          if (match) setCachedIP(match[1]);
+          if (match) {
+            setCachedIP(match[1]);
+          }
         }
         if (result.data.initialPassword) {
           setCachedPassword(result.data.initialPassword);
+          // 有初始密码说明可以显示明文 / Having initial password means can show plaintext
+          setCanShowPlainPassword(true);
         }
         // 注意：如果 running 但没有密码，会在下面的 useEffect 中自动重置
         // Note: If running but no password, auto-reset will be triggered in the useEffect below
@@ -106,7 +124,7 @@ const WebuiModalContent: React.FC = () => {
         );
       }
     } catch (error) {
-      console.error('Failed to load WebUI status:', error);
+      console.error('[WebuiModal] Failed to load WebUI status:', error);
     } finally {
       setLoading(false);
     }
@@ -141,89 +159,32 @@ const WebuiModalContent: React.FC = () => {
     return () => unsubscribe();
   }, []);
 
-  // 直接 IPC 调用重置密码 / Direct IPC call to reset password
-  // 使用 Electron 直接 IPC，绕过有问题的 bridge provider 模式
-  // Use Electron direct IPC, bypassing the problematic bridge provider pattern
-  const resetPasswordViaDirectIPC = useCallback(
-    async (shouldCopyAfter: boolean, fillForm = false) => {
-      setResetLoading(true);
-      try {
-        // 优先使用直接 IPC（Electron 环境）/ Prefer direct IPC (Electron environment)
-        if (window.electronAPI?.webuiResetPassword) {
-          console.log('[WebuiModal] Using direct IPC for reset password');
-          const result = await window.electronAPI.webuiResetPassword();
-          console.log('[WebuiModal] Direct IPC result:', result);
-
-          if (result.success && result.newPassword) {
-            setCachedPassword(result.newPassword);
-            setStatus((prev) => (prev ? { ...prev, initialPassword: result.newPassword } : null));
-
-            if (fillForm) {
-              // 重置后新密码即为当前密码，填入当前密码字段
-              // After reset, the new password becomes the current password
-              form.setFieldsValue({
-                currentPassword: result.newPassword,
-                newPassword: '',
-                confirmPassword: '',
-              });
-              message.success(t('settings.webui.passwordResetAndFilled'));
-            } else if (shouldCopyAfter) {
-              void navigator.clipboard.writeText(result.newPassword);
-              message.success(t('settings.webui.passwordResetAndCopied'));
-            } else {
-              message.success(t('settings.webui.passwordResetSuccess'));
-            }
-          } else {
-            message.error(result.msg || t('settings.webui.passwordResetFailed'));
-          }
-          setResetLoading(false);
-        } else {
-          // 后备方案：使用 bridge emitter（Web 环境）/ Fallback: use bridge emitter (Web environment)
-          // 注意：不在此处设置 setResetLoading(false)，由 emitter 回调处理
-          // Note: Don't setResetLoading(false) here, it's handled by emitter callback
-          console.log('[WebuiModal] Falling back to bridge emitter for reset password');
-          copyAfterResetRef.current = shouldCopyAfter;
-          webui.resetPassword.invoke().catch(console.error);
-        }
-      } catch (error) {
-        console.error('[WebuiModal] Reset password error:', error);
-        message.error(t('settings.webui.passwordResetFailed'));
-        setResetLoading(false);
-      }
-    },
-    [message, t, form]
-  );
-
   // 监听密码重置结果事件（Web 环境后备）/ Listen to password reset result events (Web environment fallback)
   useEffect(() => {
     const unsubscribe = webui.resetPasswordResult.on((data) => {
       if (data.success && data.newPassword) {
         setCachedPassword(data.newPassword);
         setStatus((prev) => (prev ? { ...prev, initialPassword: data.newPassword } : null));
-        if (copyAfterResetRef.current) {
-          void navigator.clipboard.writeText(data.newPassword);
-          message.success(t('settings.webui.passwordResetAndCopied'));
-          copyAfterResetRef.current = false;
-        } else {
-          message.success(t('settings.webui.passwordResetSuccess'));
-        }
-      } else {
-        message.error(data.msg || t('settings.webui.passwordResetFailed'));
-        copyAfterResetRef.current = false;
+        setCanShowPlainPassword(true);
       }
       setResetLoading(false);
     });
     return () => unsubscribe();
-  }, [message, t]);
+  }, []);
 
-  // 自动重置密码：当 WebUI 运行但没有密码时
-  // Auto-reset password: when WebUI is running but no password cached
+  // 注意：不再自动重置密码，用户已有密码存储在数据库中
+  // Note: No longer auto-reset password, user already has password stored in database
+  // 如果用户忘记密码，可以手动点击重置按钮
+  // If user forgets password, they can manually click reset button
   useEffect(() => {
-    if (status?.running && !status?.initialPassword && !cachedPassword && !loading && !resetLoading) {
-      console.log('[WebuiModal] Auto-resetting password because WebUI is running but no password cached');
-      void resetPasswordViaDirectIPC(false);
+    // 仅在组件首次加载且没有显示过密码时，标记为密文状态
+    // Only when component first loads and password hasn't been shown, mark as hidden
+    if (status?.running && !status?.initialPassword && !cachedPassword && !loading) {
+      // 不自动重置，只是确保密码显示为 ******
+      // Don't auto-reset, just ensure password shows as ******
+      setCanShowPlainPassword(false);
     }
-  }, [status?.running, status?.initialPassword, cachedPassword, loading, resetLoading, resetPasswordViaDirectIPC]);
+  }, [status?.running, status?.initialPassword, cachedPassword, loading]);
 
   // 获取当前 IP 地址 / Get current IP
   const getLocalIP = useCallback(() => {
@@ -295,13 +256,13 @@ const WebuiModalContent: React.FC = () => {
             port,
             allowRemote,
             localUrl,
+            lanIP: currentIP || prev?.lanIP,
             networkUrl: allowRemote && currentIP ? `http://${currentIP}:${port}` : undefined,
             initialPassword: cachedPassword || prev?.initialPassword,
           }));
         }
 
-        message.success(t('settings.webui.startSuccess'));
-        void shell.openExternal.invoke(localUrl);
+        Message.success(t('settings.webui.startSuccess'));
 
         // 延迟获取状态 / Delayed status fetch
         const fetchStatusWithRetry = async (retries = 3, delay = 2000) => {
@@ -323,56 +284,116 @@ const WebuiModalContent: React.FC = () => {
         webui.stop.invoke().catch((err) => console.error('WebUI stop error:', err));
         await new Promise((resolve) => setTimeout(resolve, 500));
         setStatus((prev) => (prev ? { ...prev, running: false } : null));
-        message.success(t('settings.webui.stopSuccess'));
+        Message.success(t('settings.webui.stopSuccess'));
       }
     } catch (error) {
       console.error('Toggle WebUI error:', error);
-      message.error(t('settings.webui.operationFailed'));
+      Message.error(t('settings.webui.operationFailed'));
     } finally {
       setStartLoading(false);
     }
   };
 
   // 处理允许远程访问切换 / Handle allow remote toggle
+  // 需要重启服务器才能更改绑定地址 / Need to restart server to change binding address
   const handleAllowRemoteChange = async (checked: boolean) => {
-    setAllowRemote(checked);
+    const wasRunning = status?.running;
 
-    // 启用远程访问时，总是从服务器获取最新 IP / When enabling remote, always get latest IP from server
-    let currentIP: string | null = null;
-
-    if (checked) {
+    // 如果服务器正在运行，需要重启以应用新的绑定设置
+    // If server is running, need to restart to apply new binding settings
+    if (wasRunning) {
+      setStartLoading(true);
       try {
-        const result = await Promise.race([webui.getStatus.invoke(), new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000))]);
-        if (result && result.success && result.data) {
-          if (result.data.lanIP) {
-            currentIP = result.data.lanIP;
-            setCachedIP(result.data.lanIP);
-          } else if (result.data.networkUrl) {
-            const match = result.data.networkUrl.match(/http:\/\/([^:]+):/);
-            if (match) {
-              currentIP = match[1];
-              setCachedIP(match[1]);
-            }
+        // 1. 先停止服务器 / First stop the server
+        try {
+          await Promise.race([webui.stop.invoke(), new Promise((resolve) => setTimeout(resolve, 3000))]);
+        } catch (err) {
+          console.error('WebUI stop error:', err);
+        }
+        // 等待服务器完全停止 / Wait for server to fully stop
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        // 2. 用新设置重新启动 / Restart with new settings
+        const startResult = await Promise.race([webui.start.invoke({ port, allowRemote: checked }), new Promise<null>((resolve) => setTimeout(() => resolve(null), 10000))]);
+
+        if (startResult && startResult.success && startResult.data) {
+          const responseIP = startResult.data.lanIP;
+          const responsePassword = startResult.data.initialPassword;
+
+          if (responseIP) setCachedIP(responseIP);
+          if (responsePassword) setCachedPassword(responsePassword);
+
+          setAllowRemote(checked);
+          setStatus((prev) => ({
+            ...(prev || { adminUsername: 'admin' }),
+            running: true,
+            port,
+            allowRemote: checked,
+            localUrl: `http://localhost:${port}`,
+            networkUrl: checked && responseIP ? `http://${responseIP}:${port}` : undefined,
+            lanIP: responseIP,
+            initialPassword: responsePassword || cachedPassword || prev?.initialPassword,
+          }));
+
+          Message.success(t('settings.webui.restartSuccess'));
+        } else {
+          // 响应为空或失败，但服务器可能已启动，检查状态
+          // Response is null or failed, but server might have started, check status
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+
+          let statusResult: { success: boolean; data?: IWebUIStatus } | null = null;
+          if (window.electronAPI?.webuiGetStatus) {
+            statusResult = await window.electronAPI.webuiGetStatus();
+          } else {
+            statusResult = await Promise.race([webui.getStatus.invoke(), new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000))]);
+          }
+
+          if (statusResult?.success && statusResult?.data?.running) {
+            // 服务器实际上已启动 / Server actually started
+            const responseIP = statusResult.data.lanIP;
+            if (responseIP) setCachedIP(responseIP);
+
+            setAllowRemote(checked);
+            setStatus(statusResult.data);
+            Message.success(t('settings.webui.restartSuccess'));
+          } else {
+            // 真的启动失败 / Really failed to start
+            Message.error(t('settings.webui.operationFailed'));
+            setStatus((prev) => (prev ? { ...prev, running: false } : null));
           }
         }
       } catch (error) {
-        console.error('Failed to get IP:', error);
+        console.error('[WebuiModal] Restart error:', error);
+        Message.error(t('settings.webui.operationFailed'));
+      } finally {
+        setStartLoading(false);
+      }
+    } else {
+      // 服务器未运行，只更新状态 / Server not running, just update state
+      setAllowRemote(checked);
+
+      // 获取 IP 用于显示 / Get IP for display
+      let newIP: string | undefined;
+      try {
+        if (window.electronAPI?.webuiGetStatus) {
+          const result = await window.electronAPI.webuiGetStatus();
+          if (result?.success && result?.data?.lanIP) {
+            newIP = result.data.lanIP;
+            setCachedIP(newIP);
+          }
+        }
+      } catch {
+        // ignore
       }
 
-      // 如果 API 没有返回 IP，使用缓存的 / If API didn't return IP, use cached
-      if (!currentIP) {
-        currentIP = getLocalIP();
-      }
-    }
-
-    if (status?.running) {
+      const existingIP = newIP || cachedIP || status?.lanIP;
       setStatus((prev) =>
         prev
           ? {
               ...prev,
               allowRemote: checked,
-              lanIP: currentIP || prev.lanIP,
-              networkUrl: checked && currentIP ? `http://${currentIP}:${port}` : undefined,
+              lanIP: existingIP || prev.lanIP,
+              networkUrl: checked && existingIP ? `http://${existingIP}:${port}` : undefined,
             }
           : null
       );
@@ -382,24 +403,28 @@ const WebuiModalContent: React.FC = () => {
   // 复制内容 / Copy content
   const handleCopy = (text: string) => {
     void navigator.clipboard.writeText(text);
-    message.success(t('common.copySuccess'));
+    Message.success(t('common.copySuccess'));
   };
 
-  // 复制密码 / Copy password
+  // 复制密码（复制后立即变密文）/ Copy password (immediately hide after copying)
   const handleCopyPassword = async () => {
-    const actualPassword = status?.initialPassword || cachedPassword;
-    if (actualPassword) {
-      void navigator.clipboard.writeText(actualPassword);
-      message.success(t('common.copySuccess'));
-    } else {
-      // 没有缓存的密码，触发重置并标记需要复制
-      // No cached password, trigger reset and flag for copy
-      void resetPasswordViaDirectIPC(true);
+    const password = status?.initialPassword || cachedPassword;
+    if (password) {
+      void navigator.clipboard.writeText(password);
+      Message.success(t('common.copySuccess'));
+      // 复制后立即隐藏明文，图标变成重置 / Hide plaintext immediately after copying, icon changes to reset
+      setCanShowPlainPassword(false);
     }
   };
 
-  // 修改密码 / Change password
-  const handleChangePassword = async () => {
+  // 打开设置新密码弹窗 / Open set new password modal
+  const handleResetPassword = () => {
+    form.resetFields();
+    setSetPasswordModalVisible(true);
+  };
+
+  // 提交新密码 / Submit new password
+  const handleSetNewPassword = async () => {
     try {
       const values = await form.validate();
       setPasswordLoading(true);
@@ -408,30 +433,28 @@ const WebuiModalContent: React.FC = () => {
 
       // 优先使用直接 IPC（Electron 环境）/ Prefer direct IPC (Electron environment)
       if (window.electronAPI?.webuiChangePassword) {
-        console.log('[WebuiModal] Using direct IPC for change password');
-        result = await window.electronAPI.webuiChangePassword(values.currentPassword, values.newPassword);
+        result = await window.electronAPI.webuiChangePassword(values.newPassword);
       } else {
         // 后备方案：使用 bridge / Fallback: use bridge
-        console.log('[WebuiModal] Falling back to bridge for change password');
         result = await webui.changePassword.invoke({
-          currentPassword: values.currentPassword,
           newPassword: values.newPassword,
         });
       }
 
       if (result.success) {
-        message.success(t('settings.webui.passwordChanged'));
-        setPasswordModalVisible(false);
+        Message.success(t('settings.webui.passwordChanged'));
+        setSetPasswordModalVisible(false);
         form.resetFields();
-        // 更新缓存的密码为新密码 / Update cached password to new password
+        // 更新缓存的密码为新密码，不再显示明文 / Update cached password, no longer show plaintext
         setCachedPassword(values.newPassword);
-        setStatus((prev) => (prev ? { ...prev, initialPassword: values.newPassword } : null));
+        setCanShowPlainPassword(false);
+        setStatus((prev) => (prev ? { ...prev, initialPassword: undefined } : null));
       } else {
-        message.error(result.msg || t('settings.webui.passwordChangeFailed'));
+        Message.error(result.msg || t('settings.webui.passwordChangeFailed'));
       }
     } catch (error) {
-      console.error('Change password error:', error);
-      message.error(t('settings.webui.passwordChangeFailed'));
+      console.error('Set new password error:', error);
+      Message.error(t('settings.webui.passwordChangeFailed'));
     } finally {
       setPasswordLoading(false);
     }
@@ -440,28 +463,40 @@ const WebuiModalContent: React.FC = () => {
   // 获取实际密码 / Get actual password
   const actualPassword = status?.initialPassword || cachedPassword;
   // 获取显示的密码 / Get display password
-  // 重置中显示加载状态，否则显示密码或占位文本
-  // Show loading state when resetting, otherwise show password or placeholder
-  const displayPassword = resetLoading ? t('common.loading') : actualPassword || t('settings.webui.clickCopyToGet');
+  // 密码默认显示 ***，只在首次启动时显示明文 / Password shows *** by default, only show plaintext on first startup
+  // 重置中显示加载状态 / Show loading state when resetting
+  const getDisplayPassword = () => {
+    if (resetLoading) return t('common.loading');
+    // 可以显示明文且有密码时显示明文 / Show plaintext when allowed and has password
+    if (canShowPlainPassword && actualPassword) return actualPassword;
+    // 否则显示 ****** / Otherwise show ******
+    return t('settings.webui.passwordHidden');
+  };
+  const displayPassword = getDisplayPassword();
 
-  if (loading && !status) {
+  // 浏览器端不显示 WebUI 设置，出于安全考虑 / Don't show WebUI settings in browser for security reasons
+  if (!isDesktop) {
     return (
-      <div className='flex items-center justify-center h-200px'>
-        <span className='text-t-secondary'>{t('common.loading')}</span>
+      <div className='flex flex-col h-full w-full'>
+        <div className='flex flex-col items-center justify-center h-200px px-32px text-center'>
+          <div className='text-16px font-500 text-t-primary mb-8px'>{t('settings.webui.browserNotSupported')}</div>
+          <div className='text-14px text-t-secondary'>{t('settings.webui.browserNotSupportedDesc')}</div>
+        </div>
       </div>
     );
   }
 
   return (
     <div className='flex flex-col h-full w-full'>
-      {messageContext}
-
       <AionScrollArea className='flex-1 min-h-0 pb-16px' disableOverflow={isPageMode}>
         <div className='space-y-16px'>
+          {/* 标题 / Title */}
+          <h2 className='text-20px font-500 text-t-primary m-0'>WebUI</h2>
+
           {/* 描述说明 / Description */}
-          <div className='px-[12px] md:px-[32px] text-13px text-t-secondary leading-relaxed'>
-            <p>{t('settings.webui.description')}</p>
-            <p className='mt-4px'>{t('settings.webui.steps')}</p>
+          <div className='p-16px bg-fill-2 rd-12px border border-line text-13px text-t-secondary leading-relaxed'>
+            <p className='m-0'>{t('settings.webui.description')}</p>
+            <p className='m-0 mt-4px'>{t('settings.webui.steps')}</p>
           </div>
 
           {/* WebUI 服务卡片 / WebUI Service Card */}
@@ -475,7 +510,9 @@ const WebuiModalContent: React.FC = () => {
             {status?.running && (
               <PreferenceRow label={t('settings.webui.accessUrl')}>
                 <div className='flex items-center gap-8px'>
-                  <span className='text-14px text-primary font-mono'>{getDisplayUrl()}</span>
+                  <button className='text-14px text-primary font-mono hover:underline cursor-pointer bg-transparent border-none p-0' onClick={() => shell.openExternal.invoke(getDisplayUrl()).catch(console.error)}>
+                    {getDisplayUrl()}
+                  </button>
                   <Tooltip content={t('common.copy')}>
                     <button className='p-4px text-t-tertiary hover:text-t-primary cursor-pointer bg-transparent border-none' onClick={() => handleCopy(getDisplayUrl())}>
                       <Copy size={16} />
@@ -486,7 +523,18 @@ const WebuiModalContent: React.FC = () => {
             )}
 
             {/* 允许局域网访问 / Allow LAN Access */}
-            <PreferenceRow label={t('settings.webui.allowRemote')} description={t('settings.webui.allowRemoteDesc')}>
+            <PreferenceRow
+              label={t('settings.webui.allowRemote')}
+              description={
+                <>
+                  {t('settings.webui.allowRemoteDesc')}
+                  {'  '}
+                  <button className='text-primary hover:underline cursor-pointer bg-transparent border-none p-0 text-12px' onClick={() => shell.openExternal.invoke('https://github.com/iOfficeAI/AionUi/wiki/Remote-Internet-Access-Guide').catch(console.error)}>
+                    {t('settings.webui.viewGuide')}
+                  </button>
+                </>
+              }
+            >
               <Switch checked={allowRemote} onChange={handleAllowRemoteChange} />
             </PreferenceRow>
           </div>
@@ -499,37 +547,34 @@ const WebuiModalContent: React.FC = () => {
             <InfoRow label='Username:' value={status?.adminUsername || 'admin'} onCopy={() => handleCopy(status?.adminUsername || 'admin')} />
 
             {/* 密码 / Password */}
-            <InfoRow label='Password:' value={displayPassword} onCopy={handleCopyPassword} />
-
-            {/* 修改密码按钮 / Change password button */}
-            <div className='flex items-center justify-end mt-12px pt-12px border-t border-line'>
-              <button className='text-14px text-primary hover:text-primary-hover cursor-pointer bg-transparent border-none underline' onClick={() => setPasswordModalVisible(true)}>
-                {t('settings.webui.changePassword')}
-              </button>
+            <div className='flex items-center justify-between py-12px'>
+              <span className='text-14px text-t-secondary'>Password:</span>
+              <div className='flex items-center gap-8px'>
+                <span className='text-14px text-t-primary'>{displayPassword}</span>
+                {canShowPlainPassword && actualPassword ? (
+                  // 可以显示明文时，显示复制图标 / Show copy icon when plaintext is visible
+                  <Tooltip content={t('settings.webui.copyPasswordTooltip')}>
+                    <button className='p-4px bg-transparent border-none text-t-tertiary hover:text-t-primary cursor-pointer' onClick={handleCopyPassword}>
+                      <Copy size={16} />
+                    </button>
+                  </Tooltip>
+                ) : (
+                  // 密文状态时，显示重置图标 / Show reset icon when password is hidden
+                  <Tooltip content={t('settings.webui.resetPasswordTooltip')}>
+                    <button className='p-4px bg-transparent border-none text-t-tertiary hover:text-t-primary cursor-pointer' onClick={handleResetPassword} disabled={resetLoading}>
+                      <Refresh size={16} className={resetLoading ? 'animate-spin' : ''} />
+                    </button>
+                  </Tooltip>
+                )}
+              </div>
             </div>
           </div>
         </div>
       </AionScrollArea>
 
-      {/* 修改密码弹窗 / Change Password Modal */}
-      <AionModal visible={passwordModalVisible} onCancel={() => setPasswordModalVisible(false)} onOk={handleChangePassword} confirmLoading={passwordLoading} title={t('settings.webui.changePassword')} size='small'>
+      {/* 设置新密码弹窗 / Set New Password Modal */}
+      <AionModal visible={setPasswordModalVisible} onCancel={() => setSetPasswordModalVisible(false)} onOk={handleSetNewPassword} confirmLoading={passwordLoading} title={t('settings.webui.setNewPassword')} size='small'>
         <Form form={form} layout='vertical' className='pt-16px'>
-          <Form.Item
-            label={
-              <div className='flex items-center gap-4px w-full'>
-                <span className='text-danger'>*</span>
-                <span>{t('settings.webui.currentPassword')}</span>
-                <button type='button' className='text-12px text-warning hover:text-warning-hover cursor-pointer bg-transparent border-none p-0 ml-auto' onClick={() => void resetPasswordViaDirectIPC(false, true)} disabled={resetLoading}>
-                  {resetLoading ? t('common.loading') : t('settings.webui.forgotPassword')}
-                </button>
-              </div>
-            }
-            field='currentPassword'
-            rules={[{ required: true, message: t('settings.webui.currentPasswordRequired') }]}
-            requiredSymbol={false}
-          >
-            <Input.Password placeholder={t('settings.webui.currentPasswordPlaceholder')} />
-          </Form.Item>
           <Form.Item
             label={t('settings.webui.newPassword')}
             field='newPassword'

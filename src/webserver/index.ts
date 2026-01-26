@@ -5,9 +5,9 @@
  */
 
 import express from 'express';
+import { shell } from 'electron';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import { shell } from 'electron';
 import { execSync } from 'child_process';
 import { networkInterfaces } from 'os';
 import { AuthService } from '@/webserver/auth/service/AuthService';
@@ -236,8 +236,11 @@ export async function startWebServerWithInstance(port: number, allowRemote = fal
   setupErrorHandler(app);
 
   // 启动服务器 / Start server
+  // 根据 allowRemote 决定监听地址：0.0.0.0 (所有接口) 或 127.0.0.1 (仅本地)
+  // Listen on 0.0.0.0 (all interfaces) or 127.0.0.1 (local only) based on allowRemote
+  const host = allowRemote ? SERVER_CONFIG.REMOTE_HOST : SERVER_CONFIG.DEFAULT_HOST;
   return new Promise((resolve, reject) => {
-    server.listen(port, () => {
+    server.listen(port, host, () => {
       const localUrl = `http://localhost:${port}`;
       const serverIP = getServerIP();
       const displayUrl = serverIP ? `http://${serverIP}:${port}` : localUrl;

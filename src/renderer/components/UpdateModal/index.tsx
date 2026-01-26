@@ -4,12 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Button, Progress, Space, Typography } from '@arco-design/web-react';
 import { Attention, CheckOne, Download, FileText, FolderOpen, Refresh } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import AionModal from '@/renderer/components/base/AionModal';
 import MarkdownView from '@/renderer/components/Markdown';
+import { emitter } from '@/renderer/utils/emitter';
 import type { UpdateDownloadProgressEvent, UpdateReleaseInfo } from '@/common/updateTypes';
 import { useTranslation } from 'react-i18next';
 
@@ -38,11 +39,11 @@ const UpdateModal: React.FC = () => {
     setDownloadPath('');
   };
 
-  const includePrerelease = useMemo(() => localStorage.getItem('update.includePrerelease') === 'true', [visible]);
-
   const checkForUpdates = async () => {
     setStatus('checking');
     try {
+      // Always read fresh preference from localStorage when checking
+      const includePrerelease = localStorage.getItem('update.includePrerelease') === 'true';
       const res = await ipcBridge.update.check.invoke({ includePrerelease });
       if (!res?.success) {
         throw new Error(res?.msg || t('update.checkFailed'));
@@ -101,11 +102,18 @@ const UpdateModal: React.FC = () => {
   };
 
   useEffect(() => {
-    const removeOpenListener = ipcBridge.update.open.on(() => {
+    const openAndCheck = () => {
       setVisible(true);
       resetState();
       void checkForUpdates();
-    });
+    };
+
+    const removeOpenListener = ipcBridge.update.open.on(openAndCheck);
+
+    const removeLocalOpenListener = () => {
+      emitter.off('update.open', openAndCheck);
+    };
+    emitter.on('update.open', openAndCheck);
 
     const removeProgressListener = ipcBridge.update.downloadProgress.on((evt: UpdateDownloadProgressEvent) => {
       if (!evt) return;
@@ -131,6 +139,7 @@ const UpdateModal: React.FC = () => {
 
     return () => {
       removeOpenListener();
+      removeLocalOpenListener();
       removeProgressListener();
     };
   }, [downloadId]);
