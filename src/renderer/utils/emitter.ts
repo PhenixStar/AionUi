@@ -28,6 +28,8 @@ interface EventTypes {
   'conversation.deleted': [string]; // conversationId
   // 预览面板事件 / Preview panel events
   'preview.open': [{ content: string; contentType: PreviewContentType; metadata?: { title?: string; fileName?: string } }];
+  // 更新检查事件 / Update check event
+  'update.open': [{ source?: string }];
 }
 
 export const emitter = new EventEmitter<EventTypes>();
