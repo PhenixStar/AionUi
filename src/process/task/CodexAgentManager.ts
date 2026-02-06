@@ -19,7 +19,7 @@ import { mapPermissionDecision } from '@/common/codex/utils';
 import { AIONUI_FILES_MARKER } from '@/common/constants';
 import type { IResponseMessage } from '@/common/ipcBridge';
 import { uuid } from '@/common/utils';
-import { addMessage } from '@process/message';
+import { addMessage, addOrUpdateMessage } from '@process/message';
 import { cronBusyGuard } from '@process/services/cron/CronBusyGuard';
 import { ProcessConfig } from '@process/initStorage';
 import BaseAgentManager from '@process/task/BaseAgentManager';
@@ -465,7 +465,14 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
     if (persist) {
       const tMessage = transformMessage(message);
       if (tMessage) {
-        addMessage(this.conversation_id, tMessage);
+        // These message types need to go through composeMessage logic for merging:
+        // - agent_status: same msg_id should update existing status
+        // - codex_tool_call: same toolCallId should update existing tool call
+        if (tMessage.type === 'agent_status' || tMessage.type === 'codex_tool_call') {
+          addOrUpdateMessage(this.conversation_id, tMessage);
+        } else {
+          addMessage(this.conversation_id, tMessage);
+        }
         // Note: Cron command detection is handled in CodexMessageProcessor.processFinalMessage
         // where we have the complete agent_message text
       }
