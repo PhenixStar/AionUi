@@ -88,34 +88,12 @@ function loadShellEnvironment(): Record<string, string> {
 }
 
 /**
- * Get enhanced environment variables by merging shell env with process.env.
- * For PATH, we merge both sources to ensure CLI tools are found regardless of
- * how the app was started (terminal vs Finder/launchd).
- *
- * 获取增强的环境变量，合并 shell 环境变量和 process.env。
- * 对于 PATH，合并两个来源以确保无论应用如何启动都能找到 CLI 工具。
- */
-export function getEnhancedEnv(customEnv?: Record<string, string>): Record<string, string> {
-  const shellEnv = loadShellEnvironment();
-
-  // Merge PATH from both sources (shell env may miss nvm/fnm paths in dev mode)
-  // 合并两个来源的 PATH（开发模式下 shell 环境可能缺少 nvm/fnm 路径）
-  const mergedPath = mergePaths(process.env.PATH, shellEnv.PATH);
-
-  return {
-    ...process.env,
-    ...shellEnv,
-    ...customEnv,
-    // PATH must be set after spreading to ensure merged value is used
-    PATH: customEnv?.PATH || mergedPath,
-  } as Record<string, string>;
-}
-
-/**
  * Merge two PATH strings, removing duplicates while preserving order.
+ * Exported for unit testing.
+ *
  * 合并两个 PATH 字符串，去重并保持顺序。
  */
-function mergePaths(path1?: string, path2?: string): string {
+export function mergePaths(path1?: string, path2?: string): string {
   const separator = process.platform === 'win32' ? ';' : ':';
   const paths1 = path1?.split(separator).filter(Boolean) || [];
   const paths2 = path2?.split(separator).filter(Boolean) || [];
@@ -140,6 +118,31 @@ function mergePaths(path1?: string, path2?: string): string {
   }
 
   return merged.join(separator);
+}
+
+/**
+ * Get enhanced environment variables by merging shell env with process.env.
+ * For PATH, we merge both sources to ensure CLI tools are found regardless of
+ * how the app was started (terminal vs Finder/launchd).
+ *
+ * 获取增强的环境变量，合并 shell 环境变量和 process.env。
+ * 对于 PATH，合并两个来源以确保无论应用如何启动都能找到 CLI 工具。
+ */
+export function getEnhancedEnv(customEnv?: Record<string, string>): Record<string, string> {
+  const shellEnv = loadShellEnvironment();
+
+  // Merge PATH from both sources (shell env may miss nvm/fnm paths in dev mode)
+  // 合并两个来源的 PATH（开发模式下 shell 环境可能缺少 nvm/fnm 路径）
+  const mergedPath = mergePaths(process.env.PATH, shellEnv.PATH);
+
+  return {
+    ...process.env,
+    ...shellEnv,
+    ...customEnv,
+    // PATH must be set after spreading to ensure merged value is used
+    // When customEnv.PATH exists, merge it with the already merged path (fix: don't override)
+    PATH: customEnv?.PATH ? mergePaths(mergedPath, customEnv.PATH) : mergedPath,
+  } as Record<string, string>;
 }
 
 interface PendingRequest<T = unknown> {
@@ -289,7 +292,7 @@ export class AcpConnection {
       cwd: workingDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: cleanEnv,
-      shell: true, // Use shell to resolve npx path from PATH (e.g., nvm, fnm)
+      shell: isWindows,
     });
 
     await this.setupChildProcessHandlers('claude');
