@@ -50,16 +50,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: 'macos-arm64'
-            os: 'macos-14'
-            command: 'node scripts/build-with-builder.js arm64 --mac --arm64'
-            artifact-name: 'macos-build-arm64'
-            arch: 'arm64'
-          - platform: 'macos-x64'
-            os: 'macos-14'
-            command: 'node scripts/build-with-builder.js x64 --mac --x64'
-            artifact-name: 'macos-build-x64'
-            arch: 'x64'
+          # macOS builds are handled separately to run sequentially
+          # macOS 构建单独处理，串行运行以避免 hdiutil 资源竞争
           - platform: 'windows-x64'
             os: 'windows-2022'
             command: 'node scripts/build-with-builder.js x64 --win --x64'
@@ -484,11 +476,335 @@ jobs:
 
 
 
+  # macOS ARM64 构建（独立 job，先运行）
+  # macOS ARM64 build (separate job, runs first)
+  build-macos-arm64:
+    name: Build macos-arm64
+    runs-on: macos-14
+    needs: code-quality
+    if: github.ref == 'refs/heads/dev' || (startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-dev-'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Python (for native dependencies)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-builder install-app-deps
+        env:
+          npm_config_runtime: electron
+          npm_config_disturl: https://electronjs.org/headers
+
+      - name: Get Electron version
+        id: electron-version
+        run: |
+          ELECTRON_VERSION=$(node -p "require('./package.json').devDependencies.electron.replace(/[\^~]/g, '')")
+          echo "version=$ELECTRON_VERSION" >> $GITHUB_OUTPUT
+          echo "Electron version: $ELECTRON_VERSION"
+
+      - name: Print build configuration
+        run: |
+          echo "=========================================="
+          echo "BUILD CONFIGURATION"
+          echo "=========================================="
+          echo "Platform: macos-arm64"
+          echo "Target Architecture: arm64"
+          echo "Runner OS: ${{ runner.os }}"
+          echo "Runner Arch: ${{ runner.arch }}"
+          echo "=========================================="
+
+      - name: Setup macOS code signing
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temp-keychain-password' }}
+        run: |
+          if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
+            echo "Installing code signing certificate..."
+            echo $BUILD_CERTIFICATE_BASE64 | base64 --decode > certificate.p12
+            security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+            security import certificate.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+            rm certificate.p12
+            echo "Certificate imported successfully"
+          else
+            echo "No certificate provided - building unsigned application"
+          fi
+
+      - name: Clean up stale disk images
+        run: |
+          echo "Cleaning up any stale disk images..."
+          hdiutil info 2>/dev/null | grep '/dev/disk' | awk '{print $1}' | while read disk; do
+            echo "Detaching $disk..."
+            hdiutil detach "$disk" -force 2>/dev/null || true
+          done
+          rm -f /tmp/*.dmg 2>/dev/null || true
+          echo "Cleanup complete"
+
+      - name: Build with electron-builder
+        id: macos-build
+        run: |
+          set +e
+          node scripts/build-with-builder.js arm64 --mac --arm64 2>&1 | tee "${RUNNER_TEMP}/build.log"
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+
+          DMG_EXISTS=false
+          if ls out/*.dmg 1>/dev/null 2>&1; then
+            DMG_EXISTS=true
+            echo "✅ DMG created successfully"
+          fi
+
+          if [ $BUILD_EXIT_CODE -eq 0 ]; then
+            echo "✅ Build completed successfully"
+            exit 0
+          fi
+
+          if [ "$DMG_EXISTS" = true ]; then
+            if grep -qiE "notariz|staple" "${RUNNER_TEMP}/build.log"; then
+              echo "⚠️ DMG created but notarization failed"
+              echo "::warning title=Notarization Failed::DMG was built but notarization failed."
+              exit 0
+            fi
+          fi
+
+          echo "❌ Build failed - DMG was not created"
+          exit 1
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          npm_config_arch: arm64
+          APP_ID: ${{ secrets.APP_ID }}
+          appleId: ${{ secrets.APPLE_ID }}
+          appleIdPassword: ${{ secrets.APPLE_ID_PASSWORD }}
+          teamId: ${{ secrets.TEAM_ID }}
+          identity: ${{ secrets.IDENTITY }}
+          CSC_NAME: ${{ secrets.IDENTITY }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          npm_config_cache: ${{ runner.temp }}/.npm
+          ELECTRON_CACHE: ${{ runner.temp }}/.cache/electron
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/.cache/electron-builder
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+          npm_config_electron_builder_binaries_mirror: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+          ELECTRON_MIRROR: ""
+          npm_config_disturl: https://electronjs.org/headers
+          npm_config_runtime: electron
+          npm_config_target: ${{ steps.electron-version.outputs.version }}
+          npm_config_target_arch: arm64
+          CI: true
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if security list-keychains | grep -q build.keychain; then
+            security delete-keychain build.keychain
+            echo "Temporary keychain deleted"
+          fi
+
+      - name: List build artifacts
+        if: success() || failure()
+        run: |
+          echo "=========================================="
+          echo "BUILD ARTIFACTS"
+          echo "=========================================="
+          if [ -d "out" ]; then
+            ls -lh out/ || true
+          else
+            echo "No out directory found!"
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        if: success()
+        with:
+          name: macos-build-arm64
+          path: |
+            out/*.dmg
+            out/AionUi-*-mac-*.zip
+          if-no-files-found: warn
+          retention-days: 7
+
+  # macOS x64 构建（等待 ARM64 完成后再运行，避免 hdiutil 资源竞争）
+  # macOS x64 build (waits for ARM64 to complete, avoids hdiutil resource contention)
+  build-macos-x64:
+    name: Build macos-x64
+    runs-on: macos-14
+    needs: build-macos-arm64  # 串行：等待 ARM64 完成
+    if: github.ref == 'refs/heads/dev' || (startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-dev-'))
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Python (for native dependencies)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Rebuild native modules for Electron
+        run: npx electron-builder install-app-deps
+        env:
+          npm_config_runtime: electron
+          npm_config_disturl: https://electronjs.org/headers
+
+      - name: Get Electron version
+        id: electron-version
+        run: |
+          ELECTRON_VERSION=$(node -p "require('./package.json').devDependencies.electron.replace(/[\^~]/g, '')")
+          echo "version=$ELECTRON_VERSION" >> $GITHUB_OUTPUT
+          echo "Electron version: $ELECTRON_VERSION"
+
+      - name: Print build configuration
+        run: |
+          echo "=========================================="
+          echo "BUILD CONFIGURATION"
+          echo "=========================================="
+          echo "Platform: macos-x64"
+          echo "Target Architecture: x64"
+          echo "Runner OS: ${{ runner.os }}"
+          echo "Runner Arch: ${{ runner.arch }}"
+          echo "=========================================="
+
+      - name: Setup macOS code signing
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'temp-keychain-password' }}
+        run: |
+          if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
+            echo "Installing code signing certificate..."
+            echo $BUILD_CERTIFICATE_BASE64 | base64 --decode > certificate.p12
+            security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+            security import certificate.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+            rm certificate.p12
+            echo "Certificate imported successfully"
+          else
+            echo "No certificate provided - building unsigned application"
+          fi
+
+      - name: Clean up stale disk images
+        run: |
+          echo "Cleaning up any stale disk images..."
+          hdiutil info 2>/dev/null | grep '/dev/disk' | awk '{print $1}' | while read disk; do
+            echo "Detaching $disk..."
+            hdiutil detach "$disk" -force 2>/dev/null || true
+          done
+          rm -f /tmp/*.dmg 2>/dev/null || true
+          echo "Cleanup complete"
+
+      - name: Build with electron-builder
+        id: macos-build
+        run: |
+          set +e
+          node scripts/build-with-builder.js x64 --mac --x64 2>&1 | tee "${RUNNER_TEMP}/build.log"
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+
+          DMG_EXISTS=false
+          if ls out/*.dmg 1>/dev/null 2>&1; then
+            DMG_EXISTS=true
+            echo "✅ DMG created successfully"
+          fi
+
+          if [ $BUILD_EXIT_CODE -eq 0 ]; then
+            echo "✅ Build completed successfully"
+            exit 0
+          fi
+
+          if [ "$DMG_EXISTS" = true ]; then
+            if grep -qiE "notariz|staple" "${RUNNER_TEMP}/build.log"; then
+              echo "⚠️ DMG created but notarization failed"
+              echo "::warning title=Notarization Failed::DMG was built but notarization failed."
+              exit 0
+            fi
+          fi
+
+          echo "❌ Build failed - DMG was not created"
+          exit 1
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          npm_config_arch: x64
+          APP_ID: ${{ secrets.APP_ID }}
+          appleId: ${{ secrets.APPLE_ID }}
+          appleIdPassword: ${{ secrets.APPLE_ID_PASSWORD }}
+          teamId: ${{ secrets.TEAM_ID }}
+          identity: ${{ secrets.IDENTITY }}
+          CSC_NAME: ${{ secrets.IDENTITY }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+          npm_config_cache: ${{ runner.temp }}/.npm
+          ELECTRON_CACHE: ${{ runner.temp }}/.cache/electron
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/.cache/electron-builder
+          ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+          npm_config_electron_builder_binaries_mirror: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+          ELECTRON_MIRROR: ""
+          npm_config_disturl: https://electronjs.org/headers
+          npm_config_runtime: electron
+          npm_config_target: ${{ steps.electron-version.outputs.version }}
+          npm_config_target_arch: x64
+          CI: true
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if security list-keychains | grep -q build.keychain; then
+            security delete-keychain build.keychain
+            echo "Temporary keychain deleted"
+          fi
+
+      - name: List build artifacts
+        if: success() || failure()
+        run: |
+          echo "=========================================="
+          echo "BUILD ARTIFACTS"
+          echo "=========================================="
+          if [ -d "out" ]; then
+            ls -lh out/ || true
+          else
+            echo "No out directory found!"
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        if: success()
+        with:
+          name: macos-build-x64
+          path: |
+            out/*.dmg
+            out/AionUi-*-mac-*.zip
+          if-no-files-found: warn
+          retention-days: 7
+
   # 自动重试 workflow（当构建失败时）
   auto-retry-workflow:
     name: Auto Retry on Build Failure
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-macos-arm64, build-macos-x64]
     # 关键：只在首次失败时触发，避免无限循环
     if: |
       failure() &&
@@ -547,7 +863,7 @@ jobs:
   create-tag:
     name: Create Tag from Branch
     runs-on: ubuntu-latest
-    needs: [ build ]
+    needs: [build, build-macos-arm64, build-macos-x64]
     if: success() && github.ref == 'refs/heads/dev'
     outputs:
       tag_name: ${{ steps.create_tag.outputs.tag_name }}
@@ -643,9 +959,15 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [ build, create-tag ]
+    needs: [build, build-macos-arm64, build-macos-x64, create-tag]
     # Tag 推送时 create-tag 会被跳过，所以需要检查两种情况（排除 -dev- tag 避免重复）
-    if: always() && needs.build.result == 'success' && (needs.create-tag.result == 'success' || (startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-dev-')))
+    # 所有构建 job 都必须成功
+    if: |
+      always() &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      (needs.build-macos-arm64.result == 'success' || needs.build-macos-arm64.result == 'skipped') &&
+      (needs.build-macos-x64.result == 'success' || needs.build-macos-x64.result == 'skipped') &&
+      (needs.create-tag.result == 'success' || (startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-dev-')))
     # dev 分支使用 dev-release 环境，正式 tag 使用 release 环境
     environment: ${{ needs.create-tag.outputs.is_dev == 'true' && 'dev-release' || 'release' }}
 
