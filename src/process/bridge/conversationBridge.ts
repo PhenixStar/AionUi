@@ -21,6 +21,96 @@ import WorkerManage from '../WorkerManage';
 import { migrateConversationToDatabase } from './migrationUtils';
 
 export function initConversationBridge(): void {
+  const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  const removeConversationById = async (id: string): Promise<boolean> => {
+    try {
+      const db = getDatabase();
+
+      // Get conversation to check source before deletion
+      const convResult = db.getConversation(id);
+      let conversation = convResult.data;
+      // Fallback to file storage when conversation hasn't been migrated to database yet
+      if (!conversation) {
+        const history = (await ProcessChat.get('chat.history')) || [];
+        conversation = history.find((item) => item.id === id);
+      }
+      const source = conversation?.source;
+
+      // Kill the running task if exists
+      WorkerManage.kill(id);
+
+      // Delete associated cron jobs
+      try {
+        const jobs = await cronService.listJobsByConversation(id);
+        for (const job of jobs) {
+          await cronService.removeJob(job.id);
+          ipcBridge.cron.onJobRemoved.emit({ jobId: job.id });
+        }
+      } catch (cronError) {
+        console.warn('[conversationBridge] Failed to cleanup cron jobs:', cronError);
+        // Continue with deletion even if cron cleanup fails
+      }
+
+      // If source is not 'aionui' (e.g., telegram), cleanup channel resources
+      // 如果来源不是 aionui（如 telegram），需要清理 channel 相关资源
+      if (source && source !== 'aionui') {
+        try {
+          // Dynamic import to avoid circular dependency
+          const { getChannelManager } = await import('@/channels/core/ChannelManager');
+          const channelManager = getChannelManager();
+          if (channelManager.isInitialized()) {
+            await channelManager.cleanupConversation(id);
+            console.log(`[conversationBridge] Cleaned up channel resources for ${source} conversation ${id}`);
+          }
+        } catch (cleanupError) {
+          console.warn('[conversationBridge] Failed to cleanup channel resources:', cleanupError);
+          // Continue with deletion even if cleanup fails
+        }
+      }
+
+      // Delete conversation from database (will cascade delete messages due to foreign key)
+      const result = db.deleteConversation(id);
+      if (!result.success) {
+        console.error('[conversationBridge] Failed to delete conversation from database:', result.error);
+      }
+
+      // Also remove from file storage to prevent reappearing in lazy-merge list
+      // 同步清理文件存储，避免 databaseBridge 将旧记录重新合并回来
+      let removedFromFile = false;
+      try {
+        const history = (await ProcessChat.get('chat.history')) || [];
+        if (Array.isArray(history)) {
+          const filtered = history.filter((item) => item.id !== id);
+          if (filtered.length !== history.length) {
+            await ProcessChat.set('chat.history', filtered);
+            removedFromFile = true;
+          }
+        }
+      } catch (fileError) {
+        console.warn('[conversationBridge] Failed to remove conversation from file storage:', fileError);
+      }
+
+      // Treat as success when deleted from database OR removed from legacy file storage
+      return !!result.data || removedFromFile;
+    } catch (error) {
+      console.error('[conversationBridge] Failed to remove conversation:', error);
+      return false;
+    }
+  };
+
   ipcBridge.conversation.create.provider(async (params): Promise<TChatConversation> => {
     // 使用 ConversationService 创建会话 / Use ConversationService to create conversation
     const result = await ConversationService.createConversation({
@@ -171,58 +261,29 @@ export function initConversationBridge(): void {
   });
 
   ipcBridge.conversation.remove.provider(async ({ id }) => {
-    try {
-      const db = getDatabase();
+    return removeConversationById(id);
+  });
 
-      // Get conversation to check source before deletion
-      const convResult = db.getConversation(id);
-      const conversation = convResult.data;
-      const source = conversation?.source;
-
-      // Kill the running task if exists
-      WorkerManage.kill(id);
-
-      // Delete associated cron jobs
-      try {
-        const jobs = await cronService.listJobsByConversation(id);
-        for (const job of jobs) {
-          await cronService.removeJob(job.id);
-          ipcBridge.cron.onJobRemoved.emit({ jobId: job.id });
-        }
-      } catch (cronError) {
-        console.warn('[conversationBridge] Failed to cleanup cron jobs:', cronError);
-        // Continue with deletion even if cron cleanup fails
-      }
-
-      // If source is not 'aionui' (e.g., telegram), cleanup channel resources
-      // 如果来源不是 aionui（如 telegram），需要清理 channel 相关资源
-      if (source && source !== 'aionui') {
-        try {
-          // Dynamic import to avoid circular dependency
-          const { getChannelManager } = await import('@/channels/core/ChannelManager');
-          const channelManager = getChannelManager();
-          if (channelManager.isInitialized()) {
-            await channelManager.cleanupConversation(id);
-            console.log(`[conversationBridge] Cleaned up channel resources for ${source} conversation ${id}`);
-          }
-        } catch (cleanupError) {
-          console.warn('[conversationBridge] Failed to cleanup channel resources:', cleanupError);
-          // Continue with deletion even if cleanup fails
-        }
-      }
-
-      // Delete conversation from database (will cascade delete messages due to foreign key)
-      const result = db.deleteConversation(id);
-      if (!result.success) {
-        console.error('[conversationBridge] Failed to delete conversation from database:', result.error);
-        return false;
-      }
-
-      return true;
-    } catch (error) {
-      console.error('[conversationBridge] Failed to remove conversation:', error);
-      return false;
+  ipcBridge.conversation.removeBatch.provider(async ({ ids }) => {
+    const uniqueIds = [...new Set((ids || []).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      return { successIds: [], failedIds: [] };
     }
+
+    const results = await Promise.all(
+      uniqueIds.map(async (conversationId) => {
+        const success = await withTimeout(removeConversationById(conversationId), 10000, `remove conversation timeout: ${conversationId}`).catch((error) => {
+          console.error('[conversationBridge] removeBatch item failed:', { conversationId, error });
+          return false;
+        });
+        return { conversationId, success };
+      })
+    );
+
+    const successIds = results.filter((item) => item.success).map((item) => item.conversationId);
+    const failedIds = results.filter((item) => !item.success).map((item) => item.conversationId);
+
+    return { successIds, failedIds };
   });
 
   ipcBridge.conversation.update.provider(async ({ id, updates, mergeExtra }: { id: string; updates: Partial<TChatConversation>; mergeExtra?: boolean }) => {
