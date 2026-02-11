@@ -7,6 +7,9 @@
 import type { CodexAgentManager } from '@/agent/codex';
 import { GeminiAgent, GeminiApprovalStore } from '@/agent/gemini';
 import type { TChatConversation } from '@/common/storage';
+import crypto from 'crypto';
+import fs from 'fs/promises';
+import path from 'path';
 import { getDatabase } from '@process/database';
 import { cronService } from '@process/services/cron/CronService';
 import { ipcBridge } from '../../common';
@@ -22,6 +25,69 @@ import WorkerManage from '../WorkerManage';
 import { migrateConversationToDatabase } from './migrationUtils';
 
 export function initConversationBridge(): void {
+  const computeOpenClawIdentityHash = async (workspace?: string): Promise<string | null> => {
+    if (!workspace) return null;
+    const files = ['IDENTITY.md', 'SOUL.md'];
+    const chunks: string[] = [];
+    for (const name of files) {
+      const filePath = path.join(workspace, name);
+      try {
+        const content = await fs.readFile(filePath, 'utf-8');
+        chunks.push(`${name}\n${content}`);
+      } catch {
+        // ignore missing file
+      }
+    }
+    if (chunks.length === 0) return null;
+    return crypto.createHash('sha1').update(chunks.join('\n---\n')).digest('hex');
+  };
+
+  ipcBridge.openclawConversation.getRuntime.provider(async ({ conversation_id }) => {
+    try {
+      const db = getDatabase();
+      const convResult = db.getConversation(conversation_id);
+      if (!convResult.success || !convResult.data || convResult.data.type !== 'openclaw-gateway') {
+        return { success: false, msg: 'OpenClaw conversation not found' };
+      }
+      const conversation = convResult.data;
+      const task = (await WorkerManage.getTaskByIdRollbackBuild(conversation_id)) as OpenClawAgentManager | undefined;
+      if (!task || task.type !== 'openclaw-gateway') {
+        return { success: false, msg: 'OpenClaw runtime not available' };
+      }
+
+      // Await bootstrap to ensure the agent is fully connected before returning runtime info.
+      // Without this, getRuntime may return isConnected=false while the agent is still connecting.
+      await task.bootstrap.catch(() => {});
+
+      const diagnostics = task.getDiagnostics();
+      const identityHash = await computeOpenClawIdentityHash(diagnostics.workspace || conversation.extra?.workspace);
+      const conversationModel = (conversation as { model?: { useModel?: string } }).model;
+      const extra = conversation.extra as { cliPath?: string; gateway?: { cliPath?: string }; runtimeValidation?: unknown } | undefined;
+      const gatewayCliPath = extra?.gateway?.cliPath;
+
+      return {
+        success: true,
+        data: {
+          conversationId: conversation_id,
+          runtime: {
+            workspace: diagnostics.workspace || conversation.extra?.workspace,
+            backend: diagnostics.backend || conversation.extra?.backend,
+            agentName: diagnostics.agentName || conversation.extra?.agentName,
+            cliPath: diagnostics.cliPath || extra?.cliPath || gatewayCliPath,
+            model: conversationModel?.useModel,
+            sessionKey: diagnostics.sessionKey,
+            isConnected: diagnostics.isConnected,
+            hasActiveSession: diagnostics.hasActiveSession,
+            identityHash,
+          },
+          expected: extra?.runtimeValidation,
+        },
+      };
+    } catch (error) {
+      return { success: false, msg: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   ipcBridge.conversation.create.provider(async (params): Promise<TChatConversation> => {
     // 使用 ConversationService 创建会话 / Use ConversationService to create conversation
     const result = await ConversationService.createConversation({

@@ -205,11 +205,11 @@ function convertTMessageToOutgoing(message: TMessage, platform: PluginType, isCo
 
     case 'acp_permission':
     case 'codex_permission': {
-      // Channels currently don't support interactive tool permission confirmations.
-      // Provide a clear hint instead of showing a blank/processing message.
+      // Channels (Telegram/Lark) use automatic approval via yoloMode.
+      // Show a subtle indicator instead of an error message.
       return {
         type: 'text',
-        text: `⚠️ ${formatTextForPlatform('Permission required. Please open AionUi and confirm the pending request in the conversation panel.', platform)}`,
+        text: `⏳ ${formatTextForPlatform('Applying automatic approval for permission request...', platform)}`,
         parseMode: 'HTML',
       };
     }
@@ -264,7 +264,7 @@ export class ActionExecutor {
   private async handleIncomingMessage(message: IUnifiedIncomingMessage): Promise<void> {
     const { platform, chatId, user, content, action } = message;
 
-    console.log(`[ActionExecutor] Processing message from ${platform}:${user.id}`, JSON.stringify(message));
+    console.log(`[ActionExecutor] Processing message from ${platform}:${user.id}`);
 
     // Get plugin for sending responses
     const plugin = this.getPluginForMessage(message);

@@ -14,7 +14,7 @@ import { useAddOrUpdateMessage } from '@/renderer/messages/hooks';
 import { allSupportedExts, type FileMetadata } from '@/renderer/services/FileService';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/fileSelection';
-import { Button, Tag } from '@arco-design/web-react';
+import { Button, Message, Tag } from '@arco-design/web-react';
 import { Plus } from '@icon-park/react';
 import { iconColors } from '@/renderer/theme/colors';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -155,6 +155,21 @@ const OpenClawSendBox: React.FC<{ conversation_id: string }> = ({ conversation_i
       setAiProcessing(isRunning);
       aiProcessingRef.current = isRunning;
     });
+
+    // Eagerly initialize the OpenClaw agent and recover its connection status.
+    // The agent may have already emitted 'session_active' before this listener was set up
+    // (race condition: agent starts in constructor during conversation.create, before navigation).
+    // getRuntime awaits bootstrap, so by the time it returns the agent is fully connected.
+    void ipcBridge.openclawConversation.getRuntime
+      .invoke({ conversation_id })
+      .then((res) => {
+        if (res?.success && res.data?.runtime?.hasActiveSession) {
+          setOpenClawStatus('session_active');
+        }
+      })
+      .catch(() => {
+        // Agent not ready or conversation not found – ignore
+      });
   }, [conversation_id]);
 
   useEffect(() => {
@@ -289,6 +304,47 @@ const OpenClawSendBox: React.FC<{ conversation_id: string }> = ({ conversation_i
   });
 
   const onSendHandler = async (message: string) => {
+    const runtimeOk = await (async () => {
+      const runtimeResult = await ipcBridge.openclawConversation.getRuntime.invoke({ conversation_id });
+      if (!runtimeResult?.success || !runtimeResult.data) {
+        Message.error(t('conversation.chat.switchAgentFailed', { defaultValue: 'Failed to switch agent' }));
+        return false;
+      }
+
+      const runtime = runtimeResult.data.runtime || {};
+      const expected = runtimeResult.data.expected || {};
+      const mismatches: string[] = [];
+
+      const norm = (v?: string | null) => (v || '').trim();
+      const eqPath = (a?: string | null, b?: string | null) => norm(a).replace(/[\\/]+$/, '') === norm(b).replace(/[\\/]+$/, '');
+
+      if (expected.expectedWorkspace && !eqPath(expected.expectedWorkspace, runtime.workspace)) {
+        mismatches.push(`workspace: expected=${expected.expectedWorkspace || '-'} actual=${runtime.workspace || '-'}`);
+      }
+      if (expected.expectedBackend && norm(expected.expectedBackend) !== norm(runtime.backend)) {
+        mismatches.push(`backend: expected=${expected.expectedBackend || '-'} actual=${runtime.backend || '-'}`);
+      }
+      if (expected.expectedAgentName && norm(expected.expectedAgentName) !== norm(runtime.agentName)) {
+        mismatches.push(`agent: expected=${expected.expectedAgentName || '-'} actual=${runtime.agentName || '-'}`);
+      }
+      if (expected.expectedCliPath && norm(expected.expectedCliPath) !== norm(runtime.cliPath)) {
+        mismatches.push(`cliPath: expected=${expected.expectedCliPath || '-'} actual=${runtime.cliPath || '-'}`);
+      }
+      if (expected.expectedModel && norm(expected.expectedModel) !== norm(runtime.model)) {
+        mismatches.push(`model: expected=${expected.expectedModel || '-'} actual=${runtime.model || '-'}`);
+      }
+      if (expected.expectedIdentityHash && norm(expected.expectedIdentityHash) !== norm(runtime.identityHash)) {
+        mismatches.push(`identity: expected=${expected.expectedIdentityHash || '-'} actual=${runtime.identityHash || '-'}`);
+      }
+
+      if (mismatches.length > 0) {
+        Message.error(`Agent switch validation failed: ${mismatches.join(' | ')}`);
+        return false;
+      }
+      return true;
+    })();
+    if (!runtimeOk) return;
+
     const msg_id = uuid();
     setContent('');
     emitter.emit('openclaw-gateway.selected.file.clear');
@@ -342,9 +398,42 @@ const OpenClawSendBox: React.FC<{ conversation_id: string }> = ({ conversation_i
       const stored = sessionStorage.getItem(storageKey);
       if (!stored) return;
       if (sessionStorage.getItem(processedKey)) return;
-      sessionStorage.setItem(processedKey, 'true');
 
       try {
+        const runtimeResult = await ipcBridge.openclawConversation.getRuntime.invoke({ conversation_id });
+        if (!runtimeResult?.success || !runtimeResult.data) return;
+
+        const runtime = runtimeResult.data.runtime || {};
+        const expected = runtimeResult.data.expected || {};
+        const norm = (v?: string | null) => (v || '').trim();
+        const eqPath = (a?: string | null, b?: string | null) => norm(a).replace(/[\\/]+$/, '') === norm(b).replace(/[\\/]+$/, '');
+        const mismatches: string[] = [];
+        if (expected.expectedWorkspace && !eqPath(expected.expectedWorkspace, runtime.workspace)) {
+          mismatches.push(`workspace: expected=${expected.expectedWorkspace || '-'} actual=${runtime.workspace || '-'}`);
+        }
+        if (expected.expectedBackend && norm(expected.expectedBackend) !== norm(runtime.backend)) {
+          mismatches.push(`backend: expected=${expected.expectedBackend || '-'} actual=${runtime.backend || '-'}`);
+        }
+        if (expected.expectedAgentName && norm(expected.expectedAgentName) !== norm(runtime.agentName)) {
+          mismatches.push(`agent: expected=${expected.expectedAgentName || '-'} actual=${runtime.agentName || '-'}`);
+        }
+        if (expected.expectedCliPath && norm(expected.expectedCliPath) !== norm(runtime.cliPath)) {
+          mismatches.push(`cliPath: expected=${expected.expectedCliPath || '-'} actual=${runtime.cliPath || '-'}`);
+        }
+        if (expected.expectedModel && norm(expected.expectedModel) !== norm(runtime.model)) {
+          mismatches.push(`model: expected=${expected.expectedModel || '-'} actual=${runtime.model || '-'}`);
+        }
+        if (expected.expectedIdentityHash && norm(expected.expectedIdentityHash) !== norm(runtime.identityHash)) {
+          mismatches.push(`identity: expected=${expected.expectedIdentityHash || '-'} actual=${runtime.identityHash || '-'}`);
+        }
+
+        if (mismatches.length > 0) {
+          console.warn('[OpenClawSendBox] Initial message validation failed:', mismatches.join(' | '));
+          Message.error(`Agent switch validation failed: ${mismatches.join(' | ')}`);
+          return;
+        }
+
+        sessionStorage.setItem(processedKey, 'true');
         setAiProcessing(true);
         aiProcessingRef.current = true;
         const { input, files = [] } = JSON.parse(stored) as { input: string; files?: string[] };

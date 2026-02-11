@@ -7,6 +7,7 @@
 import type { ICreateConversationParams } from '@/common/ipcBridge';
 import type { TChatConversation, TProviderWithModel } from '@/common/storage';
 import { uuid } from '@/common/utils';
+import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import { getSystemDir } from './initStorage';
@@ -34,6 +35,23 @@ const buildWorkspaceWidthFiles = async (defaultWorkspaceName: string, workspace?
   }
 
   return { workspace, customWorkspace };
+};
+
+const computeOpenClawIdentityHash = async (workspace?: string): Promise<string | null> => {
+  if (!workspace) return null;
+  const files = ['IDENTITY.md', 'SOUL.md'];
+  const chunks: string[] = [];
+  for (const name of files) {
+    const filePath = path.join(workspace, name);
+    try {
+      const content = await fs.readFile(filePath, 'utf-8');
+      chunks.push(`${name}\n${content}`);
+    } catch {
+      // missing file is acceptable
+    }
+  }
+  if (chunks.length === 0) return null;
+  return crypto.createHash('sha1').update(chunks.join('\n---\n')).digest('hex');
 };
 
 export const createGeminiAgent = async (model: TProviderWithModel, workspace?: string, defaultFiles?: string[], webSearchEngine?: 'google' | 'default', customWorkspace?: boolean, contextFileName?: string, presetRules?: string, enabledSkills?: string[], presetAssistantId?: string): Promise<TChatConversation> => {
@@ -133,13 +151,26 @@ export const createNanobotAgent = async (options: ICreateConversationParams): Pr
 export const createOpenClawAgent = async (options: ICreateConversationParams): Promise<TChatConversation> => {
   const { extra } = options;
   const { workspace, customWorkspace } = await buildWorkspaceWidthFiles(`openclaw-temp-${Date.now()}`, extra.workspace, extra.defaultFiles, extra.customWorkspace);
+  const expectedIdentityHash = await computeOpenClawIdentityHash(workspace);
   return {
     type: 'openclaw-gateway',
     extra: {
       workspace: workspace,
+      backend: extra.backend,
+      agentName: extra.agentName,
       customWorkspace,
       gateway: {
         cliPath: extra.cliPath,
+      },
+      runtimeValidation: {
+        expectedWorkspace: workspace,
+        expectedBackend: extra.backend,
+        expectedAgentName: extra.agentName,
+        expectedCliPath: extra.cliPath,
+        // Note: model is not used by openclaw-gateway, so skip expectedModel to avoid
+        // validation mismatch (conversation object doesn't store model for this type)
+        expectedIdentityHash,
+        switchedAt: extra.runtimeValidation?.switchedAt ?? Date.now(),
       },
       // Enabled skills list (loaded via SkillManager)
       enabledSkills: extra.enabledSkills,
