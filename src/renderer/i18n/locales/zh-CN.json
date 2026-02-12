@@ -637,7 +637,7 @@
     "assistant.copyCode": "复制配对码",
     "assistant.modelSaved": "模型已保存",
     "assistant.modelSaveFailed": "保存模型失败",
-    "assistant.tokenLocked": "撤销所有用户后才能更改 Token",
+    "assistant.tokenLocked": "请先关闭 Channel 并删除所有已授权用户后，再尝试修改",
     "assistant.tokenValid": "Token 有效",
     "assistant.defaultModel": "对话模型",
     "assistant.defaultModelDesc": "用于Agent对话时调用",

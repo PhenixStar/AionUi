@@ -640,7 +640,7 @@
     "assistant.copyCode": "Copy pairing code",
     "assistant.modelSaved": "Model saved",
     "assistant.modelSaveFailed": "Failed to save model",
-    "assistant.tokenLocked": "Revoke all users to change token.",
+    "assistant.tokenLocked": "Please close the Channel and delete all authorized users before modifying the configuration",
     "assistant.tokenValid": "Token valid",
     "assistant.defaultModel": "Default Model",
     "assistant.defaultModelDesc": "Model used for Telegram conversations. Default uses GEMINI CLI as Agent",

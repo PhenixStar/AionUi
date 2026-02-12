@@ -387,18 +387,37 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({ pluginStatus, modelList
         }
         required
       >
-        <Input
-          value={appId}
-          onChange={(value) => {
-            setAppId(value);
-            handleCredentialsChange();
-          }}
-          onBlur={() => setTouched((prev) => ({ ...prev, appId: true }))}
-          placeholder={hasExistingUsers || pluginStatus?.hasToken ? '••••••••••••••••' : 'cli_xxxxxxxxxx'}
-          style={{ width: 240 }}
-          status={touched.appId && !appId.trim() && !pluginStatus?.hasToken ? 'error' : undefined}
-          disabled={hasExistingUsers}
-        />
+        {hasExistingUsers ? (
+          <Tooltip content={t('settings.assistant.tokenLocked', '请先关闭 Channel 并删除所有已授权用户后，再尝试修改')}>
+            <span>
+              <Input
+                value={appId}
+                onChange={(value) => {
+                  setAppId(value);
+                  handleCredentialsChange();
+                }}
+                onBlur={() => setTouched((prev) => ({ ...prev, appId: true }))}
+                placeholder={hasExistingUsers || pluginStatus?.hasToken ? '••••••••••••••••' : 'cli_xxxxxxxxxx'}
+                style={{ width: 240 }}
+                status={touched.appId && !appId.trim() && !pluginStatus?.hasToken ? 'error' : undefined}
+                disabled={hasExistingUsers}
+              />
+            </span>
+          </Tooltip>
+        ) : (
+          <Input
+            value={appId}
+            onChange={(value) => {
+              setAppId(value);
+              handleCredentialsChange();
+            }}
+            onBlur={() => setTouched((prev) => ({ ...prev, appId: true }))}
+            placeholder={hasExistingUsers || pluginStatus?.hasToken ? '••••••••••••••••' : 'cli_xxxxxxxxxx'}
+            style={{ width: 240 }}
+            status={touched.appId && !appId.trim() && !pluginStatus?.hasToken ? 'error' : undefined}
+            disabled={hasExistingUsers}
+          />
+        )}
       </PreferenceRow>
 
       {/* App Secret */}
@@ -421,19 +440,39 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({ pluginStatus, modelList
         }
         required
       >
-        <Input.Password
-          value={appSecret}
-          onChange={(value) => {
-            setAppSecret(value);
-            handleCredentialsChange();
-          }}
-          onBlur={() => setTouched((prev) => ({ ...prev, appSecret: true }))}
-          placeholder={hasExistingUsers || pluginStatus?.hasToken ? '••••••••••••••••' : 'xxxxxxxxxxxxxxxxxx'}
-          style={{ width: 240 }}
-          status={touched.appSecret && !appSecret.trim() && !pluginStatus?.hasToken ? 'error' : undefined}
-          visibilityToggle
-          disabled={hasExistingUsers}
-        />
+        {hasExistingUsers ? (
+          <Tooltip content={t('settings.assistant.tokenLocked', '请先关闭 Channel 并删除所有已授权用户后，再尝试修改')}>
+            <span>
+              <Input.Password
+                value={appSecret}
+                onChange={(value) => {
+                  setAppSecret(value);
+                  handleCredentialsChange();
+                }}
+                onBlur={() => setTouched((prev) => ({ ...prev, appSecret: true }))}
+                placeholder={hasExistingUsers || pluginStatus?.hasToken ? '••••••••••••••••' : 'xxxxxxxxxxxxxxxxxx'}
+                style={{ width: 240 }}
+                status={touched.appSecret && !appSecret.trim() && !pluginStatus?.hasToken ? 'error' : undefined}
+                visibilityToggle
+                disabled={hasExistingUsers}
+              />
+            </span>
+          </Tooltip>
+        ) : (
+          <Input.Password
+            value={appSecret}
+            onChange={(value) => {
+              setAppSecret(value);
+              handleCredentialsChange();
+            }}
+            onBlur={() => setTouched((prev) => ({ ...prev, appSecret: true }))}
+            placeholder={hasExistingUsers || pluginStatus?.hasToken ? '••••••••••••••••' : 'xxxxxxxxxxxxxxxxxx'}
+            style={{ width: 240 }}
+            status={touched.appSecret && !appSecret.trim() && !pluginStatus?.hasToken ? 'error' : undefined}
+            visibilityToggle
+            disabled={hasExistingUsers}
+          />
+        )}
       </PreferenceRow>
 
       {/* Optional fields toggle */}
@@ -446,32 +485,68 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({ pluginStatus, modelList
         <>
           {/* Encrypt Key (Optional) */}
           <PreferenceRow label={t('settings.lark.encryptKey', 'Encrypt Key')} description={t('settings.lark.encryptKeyDesc', 'Optional: For event encryption (from Event Subscription settings)')}>
-            <Input.Password
-              value={encryptKey}
-              onChange={(value) => {
-                setEncryptKey(value);
-                handleCredentialsChange();
-              }}
-              placeholder={t('settings.lark.optional', 'Optional')}
-              style={{ width: 240 }}
-              visibilityToggle
-              disabled={hasExistingUsers}
-            />
+            {hasExistingUsers ? (
+              <Tooltip content={t('settings.assistant.tokenLocked', '请先关闭 Channel 并删除所有已授权用户后，再尝试修改')}>
+                <span>
+                  <Input.Password
+                    value={encryptKey}
+                    onChange={(value) => {
+                      setEncryptKey(value);
+                      handleCredentialsChange();
+                    }}
+                    placeholder={t('settings.lark.optional', 'Optional')}
+                    style={{ width: 240 }}
+                    visibilityToggle
+                    disabled={hasExistingUsers}
+                  />
+                </span>
+              </Tooltip>
+            ) : (
+              <Input.Password
+                value={encryptKey}
+                onChange={(value) => {
+                  setEncryptKey(value);
+                  handleCredentialsChange();
+                }}
+                placeholder={t('settings.lark.optional', 'Optional')}
+                style={{ width: 240 }}
+                visibilityToggle
+                disabled={hasExistingUsers}
+              />
+            )}
           </PreferenceRow>
 
           {/* Verification Token (Optional) */}
           <PreferenceRow label={t('settings.lark.verificationToken', 'Verification Token')} description={t('settings.lark.verificationTokenDesc', 'Optional: For event verification (from Event Subscription settings)')}>
-            <Input.Password
-              value={verificationToken}
-              onChange={(value) => {
-                setVerificationToken(value);
-                handleCredentialsChange();
-              }}
-              placeholder={t('settings.lark.optional', 'Optional')}
-              style={{ width: 240 }}
-              visibilityToggle
-              disabled={hasExistingUsers}
-            />
+            {hasExistingUsers ? (
+              <Tooltip content={t('settings.assistant.tokenLocked', '请先关闭 Channel 并删除所有已授权用户后，再尝试修改')}>
+                <span>
+                  <Input.Password
+                    value={verificationToken}
+                    onChange={(value) => {
+                      setVerificationToken(value);
+                      handleCredentialsChange();
+                    }}
+                    placeholder={t('settings.lark.optional', 'Optional')}
+                    style={{ width: 240 }}
+                    visibilityToggle
+                    disabled={hasExistingUsers}
+                  />
+                </span>
+              </Tooltip>
+            ) : (
+              <Input.Password
+                value={verificationToken}
+                onChange={(value) => {
+                  setVerificationToken(value);
+                  handleCredentialsChange();
+                }}
+                placeholder={t('settings.lark.optional', 'Optional')}
+                style={{ width: 240 }}
+                visibilityToggle
+                disabled={hasExistingUsers}
+              />
+            )}
           </PreferenceRow>
         </>
       )}

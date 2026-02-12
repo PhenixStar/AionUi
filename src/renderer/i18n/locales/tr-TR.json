@@ -631,7 +631,7 @@
     "assistant.copyCode": "Eşleştirme kodunu kopyala",
     "assistant.modelSaved": "Model kaydedildi",
     "assistant.modelSaveFailed": "Model kaydedilemedi",
-    "assistant.tokenLocked": "Token değiştirmek için tüm kullanıcıları kaldırın.",
+    "assistant.tokenLocked": "Yapılandırmayı değiştirmeden önce lütfen Channel'ı kapatın ve tüm yetkili kullanıcıları silin",
     "assistant.tokenValid": "Token geçerli",
     "assistant.defaultModel": "Varsayılan Model",
     "assistant.defaultModelDesc": "Telegram sohbetleri için kullanılan model. Varsayılan olarak GEMINI CLI Ajanı kullanılır.",
