@@ -102,7 +102,6 @@ export const handleSessionNew: ActionHandler = async (context) => {
     if (existingSession.conversationId) {
       try {
         WorkerManage.kill(existingSession.conversationId);
-        console.log(`[SystemActions] Killed old conversation: ${existingSession.conversationId}`);
       } catch (err) {
         console.warn(`[SystemActions] Failed to kill old conversation:`, err);
       }
@@ -399,7 +398,6 @@ export const handleAgentSelect: ActionHandler = async (context, params) => {
     if (existingSession.conversationId) {
       try {
         WorkerManage.kill(existingSession.conversationId);
-        console.log(`[SystemActions] Killed old conversation for agent switch: ${existingSession.conversationId}`);
       } catch (err) {
         console.warn(`[SystemActions] Failed to kill old conversation:`, err);
       }
@@ -409,8 +407,6 @@ export const handleAgentSelect: ActionHandler = async (context, params) => {
 
   // Create new session with the selected agent type
   const session = sessionManager.createSession(context.channelUser, newAgentType);
-
-  console.log(`[SystemActions] Switched agent to ${newAgentType} for user ${context.channelUser.id}`);
 
   const markup = context.platform === 'lark' ? createMainMenuCard() : createMainMenuKeyboard();
   return createSuccessResponse({
