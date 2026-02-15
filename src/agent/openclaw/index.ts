@@ -77,6 +77,10 @@ export class OpenClawAgent {
   private currentStreamMsgId: string | null = null;
   private accumulatedAssistantText = '';
 
+  // When true, all chat.event processing is skipped to prevent duplicate output
+  // during channel turns (Feishu/Telegram/DingTalk). Agent events handle rendering.
+  private channelTurnActive = false;
+
   private readonly onStreamEvent: (data: IResponseMessage) => void;
   private readonly onSignalEvent?: (data: IResponseMessage) => void;
   private readonly onSessionKeyUpdate?: (sessionKey: string) => void;
@@ -210,6 +214,7 @@ export class OpenClawAgent {
       }
 
       // Reset streaming state for new message
+      this.channelTurnActive = false;
       this.currentStreamMsgId = null;
       this.accumulatedAssistantText = '';
       this.adapter.resetMessageTracking();
@@ -273,10 +278,12 @@ export class OpenClawAgent {
         await this.start();
       }
 
-      // Pre-initialize streaming state so that handleChatEvent skips delta
-      // events (it checks currentStreamMsgId !== null). Without this, both
-      // chat events and agent events produce separate content messages,
-      // causing duplicate responses in AionUI.
+      // Block all chat.event processing for the entire channel turn.
+      // Gateway sends both agent.event and chat.event for the same response;
+      // without this flag, handleEndTurn (from agent lifecycle end) resets
+      // currentStreamMsgId, allowing late-arriving chat.event deltas to
+      // produce duplicate content in AionUI.
+      this.channelTurnActive = true;
       this.currentStreamMsgId = uuid();
       this.accumulatedAssistantText = '';
 
@@ -382,6 +389,16 @@ export class OpenClawAgent {
   }
 
   private handleChatEvent(event: ChatEvent): void {
+    // During channel turns, skip ALL chat events (delta + final).
+    // Agent events handle content rendering; letting chat events through would
+    // produce duplicate output after handleEndTurn resets currentStreamMsgId.
+    if (this.channelTurnActive) {
+      if (event.state === 'final' || event.state === 'aborted' || event.state === 'error') {
+        this.channelTurnActive = false;
+      }
+      return;
+    }
+
     // Skip delta processing when handleAgentEvent is already handling the assistant stream
     // This prevents duplicate messages with different msg_ids
     if (event.state === 'delta' && this.currentStreamMsgId) {
