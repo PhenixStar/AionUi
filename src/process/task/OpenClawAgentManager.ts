@@ -113,7 +113,10 @@ class OpenClawAgentManager extends BaseAgentManager<OpenClawAgentManagerData> {
     ipcBridge.conversation.responseStream.emit(msg);
 
     // Emit to Channel global event bus (Telegram/Lark streaming)
-    channelEventBus.emitAgentMessage(this.conversation_id, msg);
+    // Skip user_content to avoid echoing the channel user's own message back
+    if (msg.type !== 'user_content') {
+      channelEventBus.emitAgentMessage(this.conversation_id, msg);
+    }
   }
 
   private handleSignalEvent(message: IResponseMessage): void {
@@ -213,28 +216,16 @@ class OpenClawAgentManager extends BaseAgentManager<OpenClawAgentManagerData> {
     try {
       await this.bootstrap;
 
-      // Persist user message to DB and emit to BOTH frontend streams
-      // so AionUI renders the channel user's message in the conversation
+      // Route user message through handleStreamEvent — the same proven code path
+      // used by AI responses. handleStreamEvent handles DB persistence and IPC
+      // emission to both openclawConversation and conversation streams.
       if (data.msg_id && data.content) {
-        const userMessage: TMessage = {
-          id: data.msg_id,
-          msg_id: data.msg_id,
-          type: 'text',
-          position: 'right',
-          conversation_id: this.conversation_id,
-          content: { content: data.content },
-          createdAt: Date.now(),
-        };
-        addMessage(this.conversation_id, userMessage);
-
-        const userContentMsg: IResponseMessage = {
+        this.handleStreamEvent({
           type: 'user_content',
           conversation_id: this.conversation_id,
           msg_id: data.msg_id,
           data: data.content,
-        };
-        ipcBridge.openclawConversation.responseStream.emit(userContentMsg);
-        ipcBridge.conversation.responseStream.emit(userContentMsg);
+        });
       }
 
       const result = await this.agent.sendChannelMessage(data.content);
