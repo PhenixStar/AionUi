@@ -201,6 +201,32 @@ class OpenClawAgentManager extends BaseAgentManager<OpenClawAgentManagerData> {
     }
   }
 
+  /**
+   * Send a message from an external channel (Feishu/Telegram) using a separate
+   * gateway session key to avoid rs_ 404 errors with the main AionUI session.
+   * Gateway broadcasts the response to all WebSocket clients, so the main
+   * OpenClawAgentManager automatically receives and renders the reply.
+   */
+  async sendChannelMessage(data: { content: string; msg_id?: string }): Promise<void> {
+    cronBusyGuard.setProcessing(this.conversation_id, true);
+    this.status = 'running';
+    try {
+      await this.bootstrap;
+
+      const result = await this.agent.sendChannelMessage(data.content);
+      if (result.success === false) {
+        throw new Error(result.error.message || 'Failed to send channel message');
+      }
+    } catch (error) {
+      cronBusyGuard.setProcessing(this.conversation_id, false);
+      this.status = 'finished';
+
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.emitErrorMessage(`Failed to send channel message: ${errorMsg}`);
+      throw error;
+    }
+  }
+
   async confirm(id: string, callId: string, data: string) {
     super.confirm(id, callId, data);
     await this.bootstrap;

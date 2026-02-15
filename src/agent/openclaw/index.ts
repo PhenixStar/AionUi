@@ -262,6 +262,40 @@ export class OpenClawAgent {
   }
 
   /**
+   * Send a message from an external channel (Feishu/Telegram) using a separate
+   * gateway session key to avoid rs_ 404 errors with the main AionUI session.
+   * Gateway broadcasts the response to all WebSocket clients, so the main
+   * OpenClawAgentManager automatically receives and renders the reply.
+   */
+  async sendChannelMessage(content: string): Promise<AcpResult> {
+    try {
+      if (!this.connection?.isConnected) {
+        await this.start();
+      }
+
+      // Pre-initialize streaming state so that handleChatEvent skips delta
+      // events (it checks currentStreamMsgId !== null). Without this, both
+      // chat events and agent events produce separate content messages,
+      // causing duplicate responses in AionUI.
+      this.currentStreamMsgId = uuid();
+      this.accumulatedAssistantText = '';
+
+      await this.connection!.chatSend({
+        sessionKey: 'channel',
+        message: content,
+      });
+
+      return { success: true, data: null };
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: createAcpError(AcpErrorType.UNKNOWN, errorMsg, false),
+      };
+    }
+  }
+
+  /**
    * Kill the agent (compatibility method)
    */
   kill(): void {

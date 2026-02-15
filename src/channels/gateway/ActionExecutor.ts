@@ -7,6 +7,7 @@
 import type { TMessage } from '@/common/chatLib';
 import { getDatabase } from '@/process/database';
 import { ProcessConfig } from '@/process/initStorage';
+import WorkerManage from '@/process/WorkerManage';
 import { ConversationService } from '@/process/services/conversationService';
 import { buildChatErrorResponse, chatActions } from '../actions/ChatActions';
 import { handlePairingShow, platformActions } from '../actions/PlatformActions';
@@ -344,6 +345,14 @@ export class ActionExecutor {
 
       // Get or create session (scoped by chatId for per-chat isolation)
       let session = this.sessionManager.getSession(channelUser.id, chatId);
+
+      // When an active OpenClaw session exists in AionUI, ALWAYS route channel
+      // messages to it (even if a cached session points to a different conversation).
+      const activeOpenClawTask = WorkerManage.listTasks().find((t) => t.type === 'openclaw-gateway');
+      if (activeOpenClawTask && session?.conversationId !== activeOpenClawTask.id) {
+        session = this.sessionManager.createSessionWithConversation(channelUser, activeOpenClawTask.id, 'acp', undefined, chatId);
+      }
+
       if (!session || !session.conversationId) {
         const source = platform === 'lark' ? 'lark' : platform === 'dingtalk' ? 'dingtalk' : 'telegram';
 
