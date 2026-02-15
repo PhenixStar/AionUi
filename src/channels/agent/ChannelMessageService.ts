@@ -193,11 +193,12 @@ export class ChannelMessageService {
       throw error;
     }
 
-    // Emit channel user message to renderer via IPC for real-time rendering
+    // For OpenClaw: persist user message to DB and emit to openclawConversation stream.
+    // sendChannelMessage uses a separate session key so OpenClawAgentManager won't
+    // handle user message persistence — we do it here.
+    // Non-OpenClaw agents (Gemini/ACP/Codex) already handle user message display
+    // through their own sendMessage flow, so no extra IPC emission is needed.
     if (isOpenClaw) {
-      // For OpenClaw: persist user message to DB and emit to openclawConversation stream.
-      // sendChannelMessage uses a separate session key so OpenClawAgentManager won't
-      // handle user message persistence — we do it here.
       const userMessage: TMessage = {
         id: msgId,
         msg_id: msgId,
@@ -209,16 +210,7 @@ export class ChannelMessageService {
       };
       addMessage(conversationId, userMessage);
 
-      // Emit to OpenClaw-specific stream (OpenClawSendBox listens on this)
       ipcBridge.openclawConversation.responseStream.emit({
-        type: 'user_content',
-        conversation_id: conversationId,
-        msg_id: msgId,
-        data: message,
-      });
-    } else {
-      // For non-OpenClaw conversations, emit to generic conversation stream
-      ipcBridge.conversation.responseStream.emit({
         type: 'user_content',
         conversation_id: conversationId,
         msg_id: msgId,
