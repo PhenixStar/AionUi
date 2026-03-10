@@ -25,6 +25,7 @@ import CodexChat from './codex/CodexChat';
 import NanobotChat from './nanobot/NanobotChat';
 import OpenClawChat from './openclaw/OpenClawChat';
 import GeminiChat from './gemini/GeminiChat';
+import AcpModelSelector from '@/renderer/components/AcpModelSelector';
 import GeminiModelSelector from './gemini/GeminiModelSelector';
 import { useGeminiModelSelection } from './gemini/useGeminiModelSelection';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
@@ -72,10 +73,13 @@ const _AddNewConversation: React.FC<{ conversation: TChatConversation }> = ({ co
       <Button
         size='mini'
         icon={<img src={addChatIcon} alt='Add chat' className='w-14px h-14px block m-auto' />}
-        onClick={() => {
+        onClick={async () => {
           const id = uuid();
+          // Fetch latest conversation from DB to ensure sessionMode is current
+          const latest = await ipcBridge.conversation.get.invoke({ id: conversation.id }).catch((): null => null);
+          const source = latest || conversation;
           ipcBridge.conversation.createWithConversation
-            .invoke({ conversation: { ...conversation, id, createTime: Date.now(), modifyTime: Date.now() } })
+            .invoke({ conversation: { ...source, id, createTime: Date.now(), modifyTime: Date.now() } })
             .then(() => {
               Promise.resolve(navigate(`/conversation/${id}`)).catch((error) => {
                 console.error('Navigation failed:', error);
@@ -146,8 +150,8 @@ const ChatConversation: React.FC<{
     if (!conversation || isGeminiConversation) return null;
     switch (conversation.type) {
       case 'acp':
-        return <AcpChat key={conversation.id} conversation_id={conversation.id} workspace={conversation.extra?.workspace} backend={conversation.extra?.backend || 'claude'}></AcpChat>;
-      case 'codex':
+        return <AcpChat key={conversation.id} conversation_id={conversation.id} workspace={conversation.extra?.workspace} backend={conversation.extra?.backend || 'claude'} sessionMode={conversation.extra?.sessionMode} agentName={(conversation.extra as { agentName?: string })?.agentName}></AcpChat>;
+      case 'codex': // Legacy: new Codex conversations use ACP protocol. Kept for existing sessions.
         return <CodexChat key={conversation.id} conversation_id={conversation.id} workspace={conversation.extra?.workspace} />;
       case 'openclaw-gateway':
         return <OpenClawChat key={conversation.id} conversation_id={conversation.id} workspace={conversation.extra?.workspace} />;
@@ -170,10 +174,25 @@ const ChatConversation: React.FC<{
     );
   }, [t]);
 
+  // For ACP/Codex conversations, use AcpModelSelector that can show/switch models.
+  // For other non-Gemini conversations, show disabled GeminiModelSelector.
+  // NOTE: This must be placed before the Gemini early return to maintain consistent hook order.
+  const modelSelector = useMemo(() => {
+    if (!conversation || isGeminiConversation) return undefined;
+    if (conversation.type === 'acp') {
+      const extra = conversation.extra as { backend?: string; currentModelId?: string };
+      return <AcpModelSelector conversationId={conversation.id} backend={extra.backend} initialModelId={extra.currentModelId} />;
+    }
+    if (conversation.type === 'codex') {
+      return <AcpModelSelector conversationId={conversation.id} />;
+    }
+    return <GeminiModelSelector disabled={true} />;
+  }, [conversation, isGeminiConversation]);
+
   if (conversation && conversation.type === 'gemini') {
     // Gemini 会话独立渲染，带右上角模型选择
     // Render Gemini layout with dedicated top-right model selector
-    return <GeminiConversationPanel conversation={conversation} sliderTitle={sliderTitle} />;
+    return <GeminiConversationPanel key={conversation.id} conversation={conversation} sliderTitle={sliderTitle} />;
   }
 
   // 如果有预设助手信息，使用预设助手的 logo 和名称；加载中时不进入 fallback；否则使用 backend 的 logo
@@ -190,10 +209,6 @@ const ChatConversation: React.FC<{
           backend: conversation?.type === 'acp' ? conversation?.extra?.backend : conversation?.type === 'codex' ? 'codex' : conversation?.type === 'openclaw-gateway' ? 'openclaw-gateway' : conversation?.type === 'nanobot' ? 'nanobot' : undefined,
           agentName: (conversation?.extra as { agentName?: string })?.agentName,
         };
-
-  // 对于非 Gemini 对话，也显示模型选择器（禁用状态）
-  // For non-Gemini conversations, also show model selector (disabled state)
-  const modelSelector = conversation ? <GeminiModelSelector disabled={true} /> : undefined;
 
   return (
     <ChatLayout title={conversation?.name} {...chatLayoutProps} headerLeft={modelSelector} headerExtra={conversation ? <CronJobManager conversationId={conversation.id} /> : undefined} siderTitle={sliderTitle} sider={<ChatSider conversation={conversation} />} workspaceEnabled={workspaceEnabled} conversationId={conversation?.id}>

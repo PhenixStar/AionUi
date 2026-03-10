@@ -234,8 +234,8 @@ const ImageDisplay: React.FC<{
     try {
       const blob = await getImageBlob();
 
-      // Try using Clipboard API with blob
-      if (navigator.clipboard && typeof navigator.clipboard.write === 'function') {
+      // Try using Clipboard API with blob (requires secure context in WebUI)
+      if (navigator.clipboard && window.isSecureContext && typeof navigator.clipboard.write === 'function') {
         try {
           await navigator.clipboard.write([
             new ClipboardItem({
@@ -266,6 +266,10 @@ const ImageDisplay: React.FC<{
       ctx.drawImage(img, 0, 0);
       canvas.toBlob(async (canvasBlob) => {
         if (!canvasBlob) {
+          messageApi.error(t('messages.copyFailed', { defaultValue: 'Failed to copy' }));
+          return;
+        }
+        if (!navigator.clipboard || !window.isSecureContext || typeof navigator.clipboard.write !== 'function') {
           messageApi.error(t('messages.copyFailed', { defaultValue: 'Failed to copy' }));
           return;
         }
@@ -477,9 +481,9 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
               }
             />
 
-            {(description || resultDisplay) && (
+            {(description || resultDisplay || status === 'Error') && (
               <div className='mt-8px'>
-                {description && <div className='text-12px text-t-secondary truncate mb-2'>{description}</div>}
+                {description && <div className={`text-12px text-t-secondary mb-2 ${status === 'Error' ? 'whitespace-pre-wrap break-words' : 'truncate'}`}>{description}</div>}
                 {resultDisplay && (
                   <div>
                     {/* 在 Alert 外展示完整结果 Display full result outside Alert */}

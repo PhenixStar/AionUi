@@ -101,6 +101,11 @@ export class AcpAdapter {
         break;
       }
 
+      // Config option updates (e.g., model switch) are handled by AcpConnection
+      // directly in handleIncomingRequest; no chat message conversion needed.
+      case 'config_option_update':
+        break;
+
       // Disabled: available_commands messages are too noisy and distracting in the chat UI
       case 'available_commands_update':
         // Still reset message tracking so next agent_message_chunk gets new msg_id
@@ -206,13 +211,17 @@ export class AcpAdapter {
       return null;
     }
 
-    // Update the ToolCallUpdate content with new status and content
+    // Update the ToolCallUpdate content with new status, content, and rawInput
+    // rawInput may arrive in tool_call_update with complete data (after streaming completes)
+    // This fixes #1113: Claude Code MCP tool calls show empty Input in View Steps panel
     const updatedContent: ToolCallUpdate = {
       ...existingMessage.content,
       update: {
         ...existingMessage.content.update,
         status: toolCallData.status,
         content: toolCallData.content || existingMessage.content.update.content,
+        // Merge rawInput if present in the update (complete input after streaming)
+        rawInput: toolCallData.rawInput || existingMessage.content.update.rawInput,
       },
     };
 

@@ -7,16 +7,18 @@
 import type { IMessageText } from '@/common/chatLib';
 import { AIONUI_FILES_MARKER } from '@/common/constants';
 import { iconColors } from '@/renderer/theme/colors';
-import { Alert, Tooltip } from '@arco-design/web-react';
+import { Alert, Message, Tooltip } from '@arco-design/web-react';
 import { Copy } from '@icon-park/react';
 import classNames from 'classnames';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { copyText } from '@/renderer/utils/clipboard';
 import CollapsibleContent from '../components/CollapsibleContent';
 import FilePreview from '../components/FilePreview';
 import HorizontalFileList from '../components/HorizontalFileList';
 import MarkdownView from '../components/Markdown';
 import { stripThinkTags, hasThinkTags } from '../utils/thinkTagFilter';
+import MessageCronBadge from './MessageCronBadge';
 
 const parseFileMarker = (content: string) => {
   const markerIndex = content.indexOf(AIONUI_FILES_MARKER);
@@ -75,14 +77,13 @@ const MessageText: React.FC<{ message: IMessageText }> = ({ message }) => {
     const baseText = json ? JSON.stringify(data, null, 2) : text;
     const fileList = files.length ? `Files:\n${files.map((path) => `- ${path}`).join('\n')}\n\n` : '';
     const textToCopy = fileList + baseText;
-    navigator.clipboard
-      .writeText(textToCopy)
+    copyText(textToCopy)
       .then(() => {
         setShowCopyAlert(true);
         setTimeout(() => setShowCopyAlert(false), 2000);
       })
-      .catch((error) => {
-        console.error('Copy failed:', error);
+      .catch(() => {
+        Message.error(t('common.copyFailed'));
       });
   };
 
@@ -94,9 +95,12 @@ const MessageText: React.FC<{ message: IMessageText }> = ({ message }) => {
     </Tooltip>
   );
 
+  const cronMeta = message.content.cronMeta;
+
   return (
     <>
-      <div className={classNames('flex flex-col group', isUserMessage ? 'items-end' : 'items-start')}>
+      <div className={classNames('min-w-0 flex flex-col group', isUserMessage ? 'items-end' : 'items-start')}>
+        {cronMeta && <MessageCronBadge meta={cronMeta} />}
         {files.length > 0 && (
           <div className={classNames('mt-6px', { 'self-end': isUserMessage })}>
             {files.length === 1 ? (
@@ -113,9 +117,11 @@ const MessageText: React.FC<{ message: IMessageText }> = ({ message }) => {
           </div>
         )}
         <div
-          className={classNames('rd-8px rd-tr-2px [&>p:first-child]:mt-0px [&>p:last-child]:mb-0px md:max-w-780px', {
-            'bg-aou-2 p-8px': isUserMessage,
+          className={classNames('min-w-0 [&>p:first-child]:mt-0px [&>p:last-child]:mb-0px md:max-w-780px', {
+            'bg-aou-2 p-8px': isUserMessage || cronMeta,
+            'w-full': !(isUserMessage || cronMeta),
           })}
+          style={isUserMessage || cronMeta ? { borderRadius: '8px 0 8px 8px' } : undefined}
         >
           {/* JSON 内容使用折叠组件 Use CollapsibleContent for JSON content */}
           {json ? (

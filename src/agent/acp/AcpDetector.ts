@@ -8,6 +8,8 @@ import { execSync } from 'child_process';
 import type { AcpBackendAll, PresetAgentType } from '@/types/acpTypes';
 import { POTENTIAL_ACP_CLIS } from '@/types/acpTypes';
 import { ProcessConfig } from '@/process/initStorage';
+import { ExtensionRegistry } from '@/extensions';
+import { getEnhancedEnv } from '@process/utils/shellEnv';
 
 interface DetectedAgent {
   backend: AcpBackendAll;
@@ -18,7 +20,10 @@ interface DetectedAgent {
   isPreset?: boolean;
   context?: string;
   avatar?: string;
-  presetAgentType?: PresetAgentType; // Primary agent type for presets
+  // Allow extension-contributed adapter IDs (e.g. 'ext-buddy') in addition to built-in PresetAgentType values
+  presetAgentType?: PresetAgentType | string;
+  isExtension?: boolean;
+  extensionName?: string;
 }
 
 /**
@@ -27,6 +32,51 @@ interface DetectedAgent {
 class AcpDetector {
   private detectedAgents: DetectedAgent[] = [];
   private isDetected = false;
+
+  /**
+   * 将扩展贡献的 ACP adapter 添加到检测列表（即开即用，不落盘）
+   * Add extension-contributed ACP adapters to detected list (hot-load, no persistence).
+   */
+  private addExtensionAgentsToList(detected: DetectedAgent[]): void {
+    try {
+      const registry = ExtensionRegistry.getInstance();
+      const adapters = registry.getAcpAdapters();
+      if (!adapters || adapters.length === 0) return;
+
+      const extensionAgents: DetectedAgent[] = [];
+      for (const item of adapters) {
+        const adapter = item as Record<string, unknown>;
+        const id = typeof adapter.id === 'string' ? adapter.id : '';
+        const name = typeof adapter.name === 'string' ? adapter.name : id;
+        const defaultCliPath = typeof adapter.defaultCliPath === 'string' ? adapter.defaultCliPath : undefined;
+        const acpArgs = Array.isArray(adapter.acpArgs) ? adapter.acpArgs.filter((v): v is string => typeof v === 'string') : undefined;
+        const avatar = typeof adapter.avatar === 'string' ? adapter.avatar : undefined;
+        const extensionName = typeof adapter._extensionName === 'string' ? adapter._extensionName : 'unknown-extension';
+
+        // 当前 ACP 运行时仅支持 CLI adapter；HTTP/WebSocket adapter 先跳过
+        if (!defaultCliPath) {
+          continue;
+        }
+
+        extensionAgents.push({
+          backend: 'custom',
+          name,
+          cliPath: defaultCliPath,
+          acpArgs,
+          avatar,
+          customAgentId: `ext:${extensionName}:${id}`,
+          isExtension: true,
+          extensionName,
+        });
+      }
+
+      if (extensionAgents.length > 0) {
+        detected.push(...extensionAgents);
+      }
+    } catch (error) {
+      console.warn('[AcpDetector] Failed to load extension ACP adapters:', error);
+    }
+  }
 
   /**
    * 将自定义代理添加到检测列表（追加到末尾）
@@ -78,6 +128,10 @@ class AcpDetector {
     const isWindows = process.platform === 'win32';
     const whichCommand = isWindows ? 'where' : 'which';
 
+    // Get enhanced environment with user's shell PATH (includes ~/.local/bin, etc.)
+    // 获取增强的环境变量，包含用户 shell 的 PATH（如 ~/.local/bin 等）
+    const enhancedEnv = getEnhancedEnv();
+
     const isCliAvailable = (cliCommand: string): boolean => {
       // Keep original behavior: prefer where/which, then fallback on Windows to Get-Command.
       // 保持原逻辑：优先使用 where/which，Windows 下失败再回退到 Get-Command。
@@ -86,6 +140,7 @@ class AcpDetector {
           encoding: 'utf-8',
           stdio: 'pipe',
           timeout: 1000,
+          env: enhancedEnv,
         });
         return true;
       } catch {
@@ -100,6 +155,7 @@ class AcpDetector {
             encoding: 'utf-8',
             stdio: 'pipe',
             timeout: 1000,
+            env: enhancedEnv,
           });
           return true;
         } catch {
@@ -146,7 +202,10 @@ class AcpDetector {
       acpArgs: undefined,
     });
 
-    // Check for custom agents configuration - insert after claude if found
+    // Add extension-contributed agents (hot-load, no persistence)
+    this.addExtensionAgentsToList(detected);
+
+    // Check for custom agents configuration
     await this.addCustomAgentsToList(detected);
 
     this.detectedAgents = detected;
@@ -174,8 +233,8 @@ class AcpDetector {
    * Refresh custom agents detection only (called when config changes)
    */
   async refreshCustomAgents(): Promise<void> {
-    // Remove existing custom agents if present
-    this.detectedAgents = this.detectedAgents.filter((agent) => agent.backend !== 'custom');
+    // Remove existing non-extension custom agents if present
+    this.detectedAgents = this.detectedAgents.filter((agent) => !(agent.backend === 'custom' && !agent.isExtension));
 
     // Re-add custom agents with current config
     await this.addCustomAgentsToList(this.detectedAgents);

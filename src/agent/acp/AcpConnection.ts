@@ -4,10 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { AcpBackend, AcpIncomingMessage, AcpMessage, AcpNotification, AcpPermissionRequest, AcpRequest, AcpResponse, AcpSessionUpdate } from '@/types/acpTypes';
-import { ACP_METHODS, JSONRPC_VERSION } from '@/types/acpTypes';
+import type { AcpBackend, AcpIncomingMessage, AcpMessage, AcpNotification, AcpPermissionRequest, AcpRequest, AcpResponse, AcpSessionConfigOption, AcpSessionModels, AcpSessionUpdate } from '@/types/acpTypes';
+import { ACP_METHODS, CLAUDE_ACP_NPX_PACKAGE, CODEX_ACP_BRIDGE_VERSION, CODEX_ACP_NPX_PACKAGE, JSONRPC_VERSION } from '@/types/acpTypes';
 import type { ChildProcess, SpawnOptions } from 'child_process';
-import { execFileSync, spawn } from 'child_process';
+import { execFile as execFileCb, execFileSync, spawn } from 'child_process';
+import { promisify } from 'util';
+import { buildAcpModelInfo, summarizeAcpModelInfo } from './modelInfo';
+import { mainLog, mainWarn } from '@process/utils/mainLogger';
+
+const execFile = promisify(execFileCb);
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -48,14 +53,25 @@ export function createGenericSpawnConfig(cliPath: string, workingDir: string, ac
   let spawnArgs: string[];
 
   if (cliPath.startsWith('npx ')) {
-    // For "npx @package/name", split into command and arguments
-    const parts = cliPath.split(' ');
+    // For "npx @package/name [extra-args]", split into command and arguments
+    const parts = cliPath.split(' ').filter(Boolean);
     spawnCommand = resolveNpxPath(env);
     spawnArgs = [...parts.slice(1), ...effectiveAcpArgs];
-  } else {
-    // For regular paths like '/usr/local/bin/cli' or simple commands like 'goose'
-    spawnCommand = cliPath;
+  } else if (isWindows) {
+    // On Windows with shell: true, let cmd.exe handle the full command string.
+    // This correctly supports paths with spaces (e.g., "C:\Program Files\agent.exe")
+    // and commands with inline args (e.g., "goose acp" or "node path/to/file.js").
+    //
+    // chcp 65001: switch console to UTF-8 so stderr/stdout doesn't get garbled
+    // (Chinese Windows defaults to CP936/GBK).
+    spawnCommand = `chcp 65001 >nul && ${cliPath}`;
     spawnArgs = effectiveAcpArgs;
+  } else {
+    // Unix: simple command or path. If cliPath contains spaces (e.g., "goose acp"),
+    // parse into command + inline args.
+    const parts = cliPath.split(/\s+/);
+    spawnCommand = parts[0];
+    spawnArgs = [...parts.slice(1), ...effectiveAcpArgs];
   }
 
   const options: SpawnOptions = {
@@ -82,6 +98,10 @@ export class AcpConnection {
   private initializeResponse: AcpResponse | null = null;
   private workingDir: string = process.cwd();
 
+  // Cached model information from session/new response
+  private configOptions: AcpSessionConfigOption[] | null = null;
+  private models: AcpSessionModels | null = null;
+
   // Performance tracking: timestamp when last prompt was sent
   private lastPromptSentAt: number = 0;
   private firstChunkReceived: boolean = true;
@@ -101,6 +121,67 @@ export class AcpConnection {
   // Track if child process was spawned with detached: true (needs process group kill)
   private isDetached = false;
 
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async waitForProcessExit(pid: number, timeoutMs: number): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (!this.isProcessAlive(pid)) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
+  /**
+   * Kill the current child process (if any) and clear process-related state.
+   * Handles platform differences: Windows taskkill tree kill, POSIX detached
+   * process group kill, and standard SIGTERM.
+   *
+   * Used by both disconnect() and retry paths. Does NOT reset session-level
+   * state (sessionId, backend, etc.) — that is disconnect()'s responsibility.
+   */
+  private async terminateChild(): Promise<void> {
+    if (!this.child) {
+      this.isDetached = false;
+      return;
+    }
+
+    const pid = this.child.pid;
+    if (process.platform === 'win32' && pid) {
+      // Windows: shell:true spawns cmd.exe as parent; use /T /F directly to kill
+      // the entire process tree forcefully and avoid delayed exit events.
+      try {
+        await execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 5000 });
+      } catch (forceError) {
+        console.warn(`[ACP] taskkill /T /F failed for PID ${pid}:`, forceError);
+      }
+    } else if (this.isDetached && pid) {
+      // POSIX detached: negative PID kills the entire process group (setsid).
+      try {
+        process.kill(-pid, 'SIGTERM');
+      } catch {
+        this.child.kill('SIGTERM');
+      }
+    } else {
+      this.child.kill('SIGTERM');
+    }
+
+    if (pid) {
+      await this.waitForProcessExit(pid, 3000);
+    }
+
+    this.child = null;
+    this.isDetached = false;
+  }
+
   /**
    * Prepare a clean environment for npx-based ACP backends.
    * Removes Node.js debugging vars and npm lifecycle vars that can interfere
@@ -111,6 +192,9 @@ export class AcpConnection {
     delete cleanEnv.NODE_OPTIONS;
     delete cleanEnv.NODE_INSPECT;
     delete cleanEnv.NODE_DEBUG;
+    // Remove CLAUDECODE env var to prevent claude-agent-sdk from detecting
+    // a nested session when AionUi itself is launched from Claude Code.
+    delete cleanEnv.CLAUDECODE;
     // Strip npm lifecycle vars inherited from parent `npm start` process.
     // These (npm_config_*, npm_lifecycle_*, npm_package_*) can cause npx to
     // behave as if running inside an npm script, interfering with package
@@ -170,6 +254,15 @@ export class AcpConnection {
 
   // 通用的后端连接方法
   private async connectGenericBackend(backend: Exclude<AcpBackend, 'claude' | 'codebuddy' | 'codex'>, cliPath: string, workingDir: string, acpArgs?: string[], customEnv?: Record<string, string>): Promise<void> {
+    // Ensure cwd exists before spawning — on Windows cmd.exe gives a cryptic
+    // "The filename, directory name, or volume label syntax is incorrect" error
+    // when cwd is missing, which is hard to diagnose.
+    try {
+      await fs.mkdir(workingDir, { recursive: true });
+    } catch {
+      // best-effort: if mkdir fails, let spawn report the actual error
+    }
+
     const spawnStart = Date.now();
     const config = createGenericSpawnConfig(cliPath, workingDir, acpArgs, customEnv);
     this.child = spawn(config.command, config.args, config.options);
@@ -177,12 +270,62 @@ export class AcpConnection {
     await this.setupChildProcessHandlers(backend);
   }
 
+  /** Npx-based backends that may need npm cache recovery on version mismatch */
+  private static readonly NPX_BACKENDS: ReadonlySet<string> = new Set(['claude', 'codex', 'codebuddy']);
+
   async connect(backend: AcpBackend, cliPath?: string, workingDir: string = process.cwd(), acpArgs?: string[], customEnv?: Record<string, string>): Promise<void> {
     const connectStart = Date.now();
     if (ACP_PERF_LOG) console.log(`[ACP-PERF] connect: start backend=${backend}`);
 
+    try {
+      await this.doConnect(backend, cliPath, workingDir, acpArgs, customEnv);
+    } catch (error) {
+      // For npx-based backends, detect stale npm cache errors and auto-recover.
+      // When we upgrade a bridge package version (e.g., claude-agent-acp 0.17→0.18),
+      // users with the old version cached hit "notarget" because --prefer-offline
+      // serves stale metadata. Cleaning the cache and retrying fixes this.
+      const errMsg = error instanceof Error ? error.message : String(error);
+      if (AcpConnection.NPX_BACKENDS.has(backend) && /notarget|no matching version/i.test(errMsg)) {
+        console.warn(`[ACP] Detected stale npm cache for ${backend}, cleaning and retrying...`);
+        try {
+          const cleanEnv = this.prepareNpxEnv();
+          const npmPath = resolveNpxPath(cleanEnv)
+            .replace(/npx$/, 'npm')
+            .replace(/npx\.cmd$/, 'npm.cmd');
+          await execFile(npmPath, ['cache', 'clean', '--force'], { env: cleanEnv, timeout: 30000 });
+          console.warn('[ACP] npm cache cleaned, retrying connection...');
+        } catch (cleanError) {
+          console.warn('[ACP] Failed to clean npm cache:', cleanError);
+          throw error; // Throw original error if cache clean fails
+        }
+        await this.doConnect(backend, cliPath, workingDir, acpArgs, customEnv);
+      } else if (AcpConnection.NPX_BACKENDS.has(backend) && errMsg.includes('_npx') && /ENOENT|ERR_MODULE_NOT_FOUND|Cannot find package/i.test(errMsg)) {
+        // Corrupted npx cache: the _npx/<hash> directory exists but has missing
+        // or incomplete files (e.g. package.json deleted, transitive deps like zod
+        // not installed). Phase 1/2 retries don't help because npx reuses the
+        // existing directory. Fix: delete the _npx cache and retry from scratch.
+        console.warn(`[ACP] Detected corrupted npx cache for ${backend}, cleaning _npx and retrying...`);
+        try {
+          const npmCacheBase = process.platform === 'win32' ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'npm-cache') : path.join(os.homedir(), '.npm');
+          const npxCacheDir = path.join(npmCacheBase, '_npx');
+          await fs.rm(npxCacheDir, { recursive: true, force: true });
+          console.warn(`[ACP] Cleaned corrupted npx cache: ${npxCacheDir}`);
+        } catch (cleanError) {
+          console.warn('[ACP] Failed to clean npx cache:', cleanError);
+          throw error;
+        }
+        await this.doConnect(backend, cliPath, workingDir, acpArgs, customEnv);
+      } else {
+        throw error;
+      }
+    }
+
+    if (ACP_PERF_LOG) console.log(`[ACP-PERF] connect: total ${Date.now() - connectStart}ms`);
+  }
+
+  private async doConnect(backend: AcpBackend, cliPath?: string, workingDir: string = process.cwd(), acpArgs?: string[], customEnv?: Record<string, string>): Promise<void> {
     if (this.child) {
-      this.disconnect();
+      await this.disconnect();
     }
 
     this.backend = backend;
@@ -197,6 +340,10 @@ export class AcpConnection {
 
       case 'codebuddy':
         await this.connectCodebuddy(workingDir);
+        break;
+
+      case 'codex':
+        await this.connectCodex(workingDir);
         break;
 
       case 'gemini':
@@ -226,8 +373,6 @@ export class AcpConnection {
       default:
         throw new Error(`Unsupported backend: ${backend}`);
     }
-
-    if (ACP_PERF_LOG) console.log(`[ACP-PERF] connect: total ${Date.now() - connectStart}ms`);
   }
 
   private async connectClaude(workingDir: string = process.cwd()): Promise<void> {
@@ -241,22 +386,126 @@ export class AcpConnection {
 
     this.ensureMinNodeVersion(cleanEnv, 20, 10, 'Claude ACP bridge');
 
-    // Resolve npx from the same bin directory as the verified node binary
-    // to avoid picking up a stale globally-installed npx (pre npm 7)
     const isWindows = process.platform === 'win32';
     const spawnCommand = resolveNpxPath(cleanEnv);
-    const spawnArgs = ['--prefer-offline', '@zed-industries/claude-code-acp'];
+
+    // Phase 1: Try with --prefer-offline for fast startup (~1-2s)
+    try {
+      await this.spawnAndSetupNpxBackend('claude', CLAUDE_ACP_NPX_PACKAGE, spawnCommand, cleanEnv, workingDir, isWindows, true);
+    } catch (firstError) {
+      // Phase 2: Retry without --prefer-offline to refresh stale cache (~3-5s)
+      // This handles upgrades where cached registry metadata is outdated
+      console.warn('[ACP] --prefer-offline failed, retrying with fresh registry lookup:', firstError instanceof Error ? firstError.message : String(firstError));
+
+      // Terminate the first child (may still be running if initialize() timed out)
+      // to prevent orphaned processes and stale exit handlers interfering with retry
+      await this.terminateChild();
+      this.isSetupComplete = false;
+
+      await this.spawnAndSetupNpxBackend('claude', CLAUDE_ACP_NPX_PACKAGE, spawnCommand, cleanEnv, workingDir, isWindows, false);
+    }
+  }
+
+  private async spawnAndSetupNpxBackend(backend: string, npxPackage: string, spawnCommand: string, cleanEnv: Record<string, string | undefined>, workingDir: string, isWindows: boolean, preferOffline: boolean, { extraArgs = [], detached = false }: { extraArgs?: string[]; detached?: boolean } = {}): Promise<void> {
+    const spawnArgs = ['--yes', ...(preferOffline ? ['--prefer-offline'] : []), npxPackage, ...extraArgs];
 
     const spawnStart = Date.now();
+    // detached: true creates a new session (setsid) so the child has no controlling terminal.
+    // Required for backends (e.g. CodeBuddy) that write to /dev/tty — without it, SIGTTOU
+    // would suspend the entire Electron process group and freeze the UI.
+    this.isDetached = detached;
     this.child = spawn(spawnCommand, spawnArgs, {
       cwd: workingDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: cleanEnv,
       shell: isWindows,
+      detached: this.isDetached,
     });
-    if (ACP_PERF_LOG) console.log(`[ACP-PERF] connect: claude process spawned ${Date.now() - spawnStart}ms`);
+    // Prevent the detached child from keeping the parent alive when the parent wants to exit normally.
+    if (this.isDetached) {
+      this.child.unref();
+    }
+    if (ACP_PERF_LOG) {
+      console.log(`[ACP-PERF] ${backend}: process spawned ${Date.now() - spawnStart}ms (preferOffline=${preferOffline})`);
+    }
 
-    await this.setupChildProcessHandlers('claude');
+    await this.setupChildProcessHandlers(backend);
+  }
+
+  private async connectCodex(workingDir: string = process.cwd()): Promise<void> {
+    // Use NPX to run codex-acp bridge (Zed's ACP adapter for Codex)
+    console.error(`[ACP] Using NPX approach for Codex ACP bridge (${CODEX_ACP_NPX_PACKAGE})`);
+
+    const envStart = Date.now();
+    const cleanEnv = this.prepareNpxEnv();
+    if (ACP_PERF_LOG) console.log(`[ACP-PERF] codex: env prepared ${Date.now() - envStart}ms`);
+
+    this.ensureMinNodeVersion(cleanEnv, 20, 10, 'Codex ACP bridge');
+    await this.logCodexRuntimeDiagnostics(cleanEnv);
+
+    const isWindows = process.platform === 'win32';
+    const spawnCommand = resolveNpxPath(cleanEnv);
+
+    // Phase 1: Try with --prefer-offline for fast startup
+    try {
+      await this.spawnAndSetupNpxBackend('codex', CODEX_ACP_NPX_PACKAGE, spawnCommand, cleanEnv, workingDir, isWindows, true);
+    } catch (firstError) {
+      // Phase 2: Retry without --prefer-offline to fetch from registry
+      // This handles first-time installs or missing cache (common on Windows after upgrade)
+      console.warn('[ACP] Codex --prefer-offline failed, retrying with fresh registry lookup:', firstError instanceof Error ? firstError.message : String(firstError));
+
+      // Terminate the first child to prevent orphaned processes and stale exit handlers
+      await this.terminateChild();
+      this.isSetupComplete = false;
+
+      await this.spawnAndSetupNpxBackend('codex', CODEX_ACP_NPX_PACKAGE, spawnCommand, cleanEnv, workingDir, isWindows, false);
+    }
+  }
+
+  private async logCodexRuntimeDiagnostics(cleanEnv: Record<string, string | undefined>): Promise<void> {
+    const codexCommand = process.platform === 'win32' ? 'codex.cmd' : 'codex';
+    const diagnostics: {
+      bridgeVersion: string;
+      bridgePackage: string;
+      codexCliVersion: string;
+      loginStatus: string;
+      hasCodexApiKey: boolean;
+      hasOpenAiApiKey: boolean;
+      hasChatGptSession: boolean;
+    } = {
+      bridgeVersion: CODEX_ACP_BRIDGE_VERSION,
+      bridgePackage: CODEX_ACP_NPX_PACKAGE,
+      codexCliVersion: 'unknown',
+      loginStatus: 'unknown',
+      hasCodexApiKey: Boolean(cleanEnv.CODEX_API_KEY),
+      hasOpenAiApiKey: Boolean(cleanEnv.OPENAI_API_KEY),
+      hasChatGptSession: false,
+    };
+
+    try {
+      const { stdout } = await execFile(codexCommand, ['--version'], {
+        env: cleanEnv,
+        timeout: 5000,
+        windowsHide: true,
+      });
+      diagnostics.codexCliVersion = stdout.trim() || diagnostics.codexCliVersion;
+    } catch (error) {
+      mainWarn('[ACP codex]', 'Failed to read codex CLI version', error);
+    }
+
+    try {
+      const { stdout } = await execFile(codexCommand, ['login', 'status'], {
+        env: cleanEnv,
+        timeout: 5000,
+        windowsHide: true,
+      });
+      diagnostics.loginStatus = stdout.trim() || diagnostics.loginStatus;
+      diagnostics.hasChatGptSession = /chatgpt/i.test(diagnostics.loginStatus);
+    } catch (error) {
+      mainWarn('[ACP codex]', 'Failed to read codex login status', error);
+    }
+
+    mainLog('[ACP codex]', 'Runtime diagnostics', diagnostics);
   }
 
   private async connectCodebuddy(workingDir: string = process.cwd()): Promise<void> {
@@ -269,46 +518,37 @@ export class AcpConnection {
 
     this.ensureMinNodeVersion(cleanEnv, 20, 10, 'CodeBuddy ACP');
 
-    // Resolve npx from the verified node bin directory (same as connectClaude)
     const isWindows = process.platform === 'win32';
     const spawnCommand = resolveNpxPath(cleanEnv);
-    const spawnArgs = ['--yes', '--prefer-offline', '@tencent-ai/codebuddy-code', '--acp'];
 
     // Load user's MCP config if available (~/.codebuddy/mcp.json)
     // CodeBuddy CLI in --acp mode does not auto-load mcp.json, so we pass it explicitly
     const mcpConfigPath = path.join(os.homedir(), '.codebuddy', 'mcp.json');
+    const extraArgs: string[] = [];
     try {
       await fs.access(mcpConfigPath);
-      spawnArgs.push('--mcp-config', mcpConfigPath);
+      extraArgs.push('--mcp-config', mcpConfigPath);
       console.error(`[ACP] Loading CodeBuddy MCP config from ${mcpConfigPath}`);
     } catch {
       console.error('[ACP] No CodeBuddy MCP config found, starting without MCP servers');
     }
 
-    if (ACP_PERF_LOG) console.log(`[ACP-PERF] codebuddy: spawning ${spawnCommand} ${spawnArgs.join(' ')}`);
-    const spawnStart = Date.now();
-    // Use detached: true to create a new session (setsid) so the child
-    // has no controlling terminal. Without this, CodeBuddy CLI's attempt
-    // to write to /dev/tty triggers SIGTTOU, which suspends the entire
-    // Electron process group and freezes the UI.
-    this.isDetached = !isWindows;
-    this.child = spawn(spawnCommand, spawnArgs, {
-      cwd: workingDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: cleanEnv,
-      shell: isWindows,
-      detached: this.isDetached,
-    });
-    // Prevent the detached child from keeping the parent alive when
-    // the parent wants to exit normally.
-    if (this.isDetached) {
-      this.child.unref();
-    }
-    if (ACP_PERF_LOG) console.log(`[ACP-PERF] codebuddy: process spawned ${Date.now() - spawnStart}ms`);
+    const spawnOptions = { extraArgs: ['--acp', ...extraArgs], detached: !isWindows };
 
-    const handlerStart = Date.now();
-    await this.setupChildProcessHandlers('codebuddy');
-    if (ACP_PERF_LOG) console.log(`[ACP-PERF] codebuddy: handlers setup + initialize completed ${Date.now() - handlerStart}ms`);
+    // Phase 1: Try with --prefer-offline for fast startup
+    try {
+      await this.spawnAndSetupNpxBackend('codebuddy', '@tencent-ai/codebuddy-code', spawnCommand, cleanEnv, workingDir, isWindows, true, spawnOptions);
+    } catch (firstError) {
+      // Phase 2: Retry without --prefer-offline to refresh stale cache
+      console.warn('[ACP] CodeBuddy --prefer-offline failed, retrying with fresh registry lookup:', firstError instanceof Error ? firstError.message : String(firstError));
+
+      // Terminate the first child (may still be running if initialize() timed out)
+      // to prevent orphaned processes and stale exit handlers interfering with retry
+      await this.terminateChild();
+      this.isSetupComplete = false;
+
+      await this.spawnAndSetupNpxBackend('codebuddy', '@tencent-ai/codebuddy-code', spawnCommand, cleanEnv, workingDir, isWindows, false, spawnOptions);
+    }
   }
 
   private async setupChildProcessHandlers(backend: string): Promise<void> {
@@ -335,7 +575,13 @@ export class AcpConnection {
     });
 
     child.on('error', (error) => {
-      spawnError = error;
+      // Provide a friendlier message when the CLI binary is not found (ENOENT)
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        const cliHint = this.backend ?? backend;
+        spawnError = new Error(`'${cliHint}' CLI not found. Please install it or update the CLI path in Settings.`);
+      } else {
+        spawnError = error;
+      }
     });
 
     // Promise that rejects when the child process exits during setup.
@@ -350,12 +596,24 @@ export class AcpConnection {
       console.error(`[ACP ${backend}] Process exited with code: ${code}, signal: ${signal}`);
 
       if (!this.isSetupComplete) {
-        // Startup phase - set error for initial check
+        // Startup phase - set error for initial check.
+        // Include stderr in spawnError so callers can detect specific failures
+        // (e.g., npm "notarget" for stale cache recovery).
+        let errMsg: string;
+        if (stderrOutput) {
+          errMsg = `${backend} ACP process exited during startup (code: ${code}):\n${stderrOutput}`;
+        } else {
+          errMsg = `${backend} ACP process exited during startup (code: ${code}, signal: ${signal})`;
+        }
+        // Detect "command not found" patterns across platforms and provide a clear hint
+        if (code !== 0 && /not recognized|not found|No such file|command not found|ENOENT/i.test(stderrOutput + (spawnError?.message ?? ''))) {
+          const cliHint = this.backend ?? backend;
+          errMsg = `'${cliHint}' CLI not found. Please install it or update the CLI path in Settings.\n${stderrOutput}`;
+        }
         if (code !== 0 && !spawnError) {
-          spawnError = new Error(`${backend} ACP process failed with exit code: ${code}`);
+          spawnError = new Error(errMsg);
         }
         // Reject processExitPromise so Promise.race returns immediately
-        const errMsg = stderrOutput ? `${backend} ACP process exited during startup (code: ${code}):\n${stderrOutput}` : `${backend} ACP process exited during startup (code: ${code}, signal: ${signal})`;
         processExitReject?.(new Error(errMsg));
       } else {
         // Runtime phase - handle unexpected exit
@@ -449,6 +707,8 @@ export class AcpConnection {
     this.isDetached = false;
     this.backend = null;
     this.initializeResponse = null;
+    this.configOptions = null;
+    this.models = null;
     this.child = null;
 
     // 3. Notify AcpAgent about disconnect
@@ -652,6 +912,13 @@ export class AcpConnection {
           }
           // Reset timeout on streaming updates - LLM is still processing
           this.resetSessionPromptTimeouts();
+          // Update cached configOptions when config_option_update arrives
+          if (message.params?.update && (message.params.update as Record<string, unknown>).sessionUpdate === 'config_option_update') {
+            const updatePayload = message.params.update as { configOptions?: AcpSessionConfigOption[] };
+            if (Array.isArray(updatePayload.configOptions)) {
+              this.configOptions = updatePayload.configOptions;
+            }
+          }
           this.onSessionUpdate(message.params);
           break;
         case ACP_METHODS.REQUEST_PERMISSION:
@@ -810,7 +1077,7 @@ export class AcpConnection {
     const normalizedCwd = this.normalizeCwdForAgent(cwd);
 
     // Build _meta for Claude/CodeBuddy ACP resume support
-    // claude-code-acp and codebuddy use _meta.claudeCode.options.resume for session resume
+    // claude-agent-acp and codebuddy use _meta.claudeCode.options.resume for session resume
     const useMetaResume = (this.backend === 'claude' || this.backend === 'codebuddy') && options?.resumeSessionId;
     const meta = useMetaResume
       ? {
@@ -833,7 +1100,68 @@ export class AcpConnection {
     });
 
     this.sessionId = response.sessionId;
+
+    this.parseSessionCapabilities(response);
+
+    // Debug: log full session/new response only when ACP_PERF=1
+    if (ACP_PERF_LOG) {
+      console.log(`[ACP ${this.backend}] session/new response:`, JSON.stringify(response, null, 2));
+    }
+
     return response;
+  }
+
+  /**
+   * Load/resume an existing session using the ACP session/load method.
+   * Codex ACP bridge implements `load_session()` which internally calls
+   * `resume_thread_from_rollout` to restore full conversation history from disk.
+   *
+   * @param sessionId - The session ID to load/resume
+   * @param cwd - Working directory for the session
+   */
+  async loadSession(sessionId: string, cwd: string = process.cwd()): Promise<AcpResponse & { sessionId?: string }> {
+    const normalizedCwd = this.normalizeCwdForAgent(cwd);
+
+    const response = await this.sendRequest<AcpResponse & { sessionId?: string }>('session/load', {
+      sessionId,
+      cwd: normalizedCwd,
+      mcpServers: [] as unknown[],
+    });
+
+    // session/load returns modes/models/configOptions but not sessionId — keep the one we sent
+    this.sessionId = response.sessionId || sessionId;
+
+    mainLog(`[ACP ${this.backend}]`, 'session/load completed', { sessionId: this.sessionId });
+
+    this.parseSessionCapabilities(response);
+
+    return response;
+  }
+
+  /**
+   * Parse configOptions and models from a session response (session/new or session/load).
+   * Logs model info for Codex backend.
+   */
+  private parseSessionCapabilities(response: unknown): void {
+    const result = response as Record<string, unknown>;
+    if (Array.isArray(result.configOptions)) {
+      this.configOptions = result.configOptions as AcpSessionConfigOption[];
+    }
+    // Check top-level models first, then fall back to _meta.models (used by iFlow)
+    const modelsSource = result.models || (result._meta as Record<string, unknown> | undefined)?.models;
+    if (modelsSource && typeof modelsSource === 'object') {
+      this.models = modelsSource as AcpSessionModels;
+    }
+    if (this.backend === 'codex') {
+      const unifiedModelInfo = buildAcpModelInfo(this.configOptions, this.models);
+      const modelOption = this.configOptions?.find((opt) => opt.category === 'model');
+      mainLog('[ACP codex]', 'session capabilities parsed', {
+        rawCurrentModelId: this.models?.currentModelId || null,
+        rawAvailableModelCount: this.models?.availableModels?.length || 0,
+        configOptionModelCount: modelOption && modelOption.type === 'select' && modelOption.options ? modelOption.options.length : 0,
+        unified: summarizeAcpModelInfo(unifiedModelInfo),
+      });
+    }
   }
 
   /**
@@ -844,9 +1172,10 @@ export class AcpConnection {
     const defaultPath = '.';
     if (!cwd) return defaultPath;
 
-    // GitHub Copilot CLI requires absolute paths
-    // Error: "Directory path must be absolute: ."
-    if (this.backend === 'copilot') {
+    // Some CLIs require absolute paths for cwd
+    // - Copilot: "Directory path must be absolute: ."
+    // - Codex (via codex-acp): "cwd is not absolute: ."
+    if (this.backend === 'copilot' || this.backend === 'codex') {
       return path.resolve(cwd);
     }
 
@@ -898,39 +1227,71 @@ export class AcpConnection {
       throw new Error('No active ACP session');
     }
 
-    return await this.sendRequest('session/set_model', {
+    const response = await this.sendRequest<AcpResponse>('session/set_model', {
       sessionId: this.sessionId,
       modelId,
     });
-  }
 
-  disconnect(): void {
-    if (this.child) {
-      const pid = this.child.pid;
-      if (this.isDetached && pid) {
-        // For detached processes (CodeBuddy on non-Windows), kill the entire
-        // process group so npx's child CLI also terminates.
-        // Negative PID = process group kill (POSIX setsid).
-        try {
-          process.kill(-pid, 'SIGTERM');
-        } catch {
-          // Fallback: process group kill failed (e.g., already exited)
-          this.child.kill('SIGTERM');
-        }
-      } else {
-        this.child.kill('SIGTERM');
-      }
-      this.child = null;
+    // Update local models cache with the new model ID
+    if (this.models) {
+      this.models = { ...this.models, currentModelId: modelId };
     }
 
-    // Reset state
+    // Also update configOptions cache so getModelInfo() returns consistent data.
+    // The unstable_setSessionModel handler in claude-agent-acp will also send a
+    // config_option_update notification, but we update eagerly for immediate reads.
+    if (this.configOptions) {
+      this.configOptions = this.configOptions.map((opt) => (opt.category === 'model' ? { ...opt, currentValue: modelId, selectedValue: modelId } : opt));
+    }
+
+    return response;
+  }
+
+  async setConfigOption(configId: string, value: string): Promise<AcpResponse> {
+    if (!this.sessionId) {
+      throw new Error('No active ACP session');
+    }
+
+    const response = await this.sendRequest<AcpResponse>(ACP_METHODS.SET_CONFIG_OPTION, {
+      sessionId: this.sessionId,
+      configId,
+      value,
+    });
+
+    // The response may contain the updated configOptions
+    const result = response as unknown as Record<string, unknown>;
+    if (Array.isArray(result.configOptions)) {
+      this.configOptions = result.configOptions as AcpSessionConfigOption[];
+    } else if (this.configOptions) {
+      // Optimistically update the cached currentValue so getModelInfo() reflects
+      // the switch immediately, even if the agent responds without configOptions.
+      // A subsequent config_option_update notification will overwrite this if needed.
+      this.configOptions = this.configOptions.map((opt) => (opt.id === configId ? { ...opt, currentValue: value, selectedValue: value } : opt));
+    }
+
+    return response;
+  }
+
+  getConfigOptions(): AcpSessionConfigOption[] | null {
+    return this.configOptions;
+  }
+
+  getModels(): AcpSessionModels | null {
+    return this.models;
+  }
+
+  async disconnect(): Promise<void> {
+    await this.terminateChild();
+
+    // Reset session-level state
     this.pendingRequests.clear();
     this.sessionId = null;
     this.isInitialized = false;
     this.isSetupComplete = false;
-    this.isDetached = false;
     this.backend = null;
     this.initializeResponse = null;
+    this.configOptions = null;
+    this.models = null;
   }
 
   get isConnected(): boolean {

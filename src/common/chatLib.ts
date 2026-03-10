@@ -90,7 +90,14 @@ interface IMessage<T extends TMessageType, Content extends Record<string, any>> 
   status?: 'finish' | 'pending' | 'error' | 'work';
 }
 
-export type IMessageText = IMessage<'text', { content: string }>;
+export type CronMessageMeta = {
+  source: 'cron';
+  cronJobId: string;
+  cronJobName: string;
+  triggeredAt: number;
+};
+
+export type IMessageText = IMessage<'text', { content: string; cronMeta?: CronMessageMeta }>;
 
 export type IMessageTips = IMessage<'tips', { content: string; type: 'error' | 'success' | 'warning' }>;
 
@@ -168,6 +175,8 @@ export type IMessageAgentStatus = IMessage<
   {
     backend: AcpBackend; // Agent identifier: 'claude', 'qwen', 'codex', etc.
     status: 'connecting' | 'connected' | 'authenticated' | 'session_active' | 'disconnected' | 'error';
+    /** Display name for the agent (e.g. extension-contributed adapter name) / Agent 显示名称 */
+    agentName?: string;
     // Optional legacy fields for backward compatibility
     sessionId?: string;
     isConnected?: boolean;
@@ -317,15 +326,15 @@ export const transformMessage = (message: IResponseMessage): TMessage => {
     }
     case 'content':
     case 'user_content': {
+      const data = message.data;
+      const isRichData = typeof data === 'object' && data !== null && 'content' in data;
       return {
         id: uuid(),
         type: 'text',
         msg_id: message.msg_id,
         position: message.type === 'content' ? 'left' : 'right',
         conversation_id: message.conversation_id,
-        content: {
-          content: message.data as string,
-        },
+        content: isRichData ? { content: (data as { content: string; cronMeta?: CronMessageMeta }).content, cronMeta: (data as { cronMeta?: CronMessageMeta }).cronMeta } : { content: data as string },
       };
     }
     case 'tool_call': {
@@ -414,6 +423,9 @@ export const transformMessage = (message: IResponseMessage): TMessage => {
     case 'finish':
     case 'thought':
     case 'system': // Cron system responses, ignored
+    case 'acp_model_info': // Model info updates, handled by AcpModelSelector
+    case 'codex_model_info': // Codex model info updates, handled by AcpModelSelector
+    case 'request_trace': // Request trace events, logged to F12 console (not persisted)
       break;
     default: {
       throw new Error(`Unsupported message type '${message.type}'. All non-standard message types should be pre-processed by respective AgentManagers.`);

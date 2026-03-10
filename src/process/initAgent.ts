@@ -37,7 +37,7 @@ const buildWorkspaceWidthFiles = async (defaultWorkspaceName: string, workspace?
   return { workspace, customWorkspace };
 };
 
-export const createGeminiAgent = async (model: TProviderWithModel, workspace?: string, defaultFiles?: string[], webSearchEngine?: 'google' | 'default', customWorkspace?: boolean, contextFileName?: string, presetRules?: string, enabledSkills?: string[], presetAssistantId?: string, sessionMode?: string): Promise<TChatConversation> => {
+export const createGeminiAgent = async (model: TProviderWithModel, workspace?: string, defaultFiles?: string[], webSearchEngine?: 'google' | 'default', customWorkspace?: boolean, contextFileName?: string, presetRules?: string, enabledSkills?: string[], presetAssistantId?: string, sessionMode?: string, isHealthCheck?: boolean): Promise<TChatConversation> => {
   const { workspace: newWorkspace, customWorkspace: finalCustomWorkspace } = await buildWorkspaceWidthFiles(`gemini-temp-${Date.now()}`, workspace, defaultFiles, customWorkspace);
 
   return {
@@ -59,6 +59,8 @@ export const createGeminiAgent = async (model: TProviderWithModel, workspace?: s
       presetAssistantId,
       // Initial session mode from Guid page mode selector
       sessionMode,
+      // Explicit marker for temporary health-check conversations
+      isHealthCheck,
     },
     desc: finalCustomWorkspace ? newWorkspace : '',
     createTime: Date.now(),
@@ -88,6 +90,10 @@ export const createAcpAgent = async (options: ICreateConversationParams): Promis
       presetAssistantId: extra.presetAssistantId,
       // Initial session mode selected on Guid page (from AgentModeSelector)
       sessionMode: extra.sessionMode,
+      // Pre-selected model from Guid page (cached model list)
+      currentModelId: extra.currentModelId,
+      // Explicit marker for temporary health-check conversations
+      isHealthCheck: extra.isHealthCheck,
     },
     createTime: Date.now(),
     modifyTime: Date.now(),
@@ -96,6 +102,7 @@ export const createAcpAgent = async (options: ICreateConversationParams): Promis
   };
 };
 
+/** @deprecated Legacy Codex creation. New Codex conversations use ACP protocol via createAcpAgent. */
 export const createCodexAgent = async (options: ICreateConversationParams): Promise<TChatConversation> => {
   const { extra } = options;
   const { workspace, customWorkspace } = await buildWorkspaceWidthFiles(`codex-temp-${Date.now()}`, extra.workspace, extra.defaultFiles, extra.customWorkspace);
@@ -114,6 +121,10 @@ export const createCodexAgent = async (options: ICreateConversationParams): Prom
       presetAssistantId: extra.presetAssistantId,
       // Initial session mode selected on Guid page (from AgentModeSelector)
       sessionMode: extra.sessionMode,
+      // User-selected Codex model from Guid page
+      codexModel: extra.codexModel,
+      // Explicit marker for temporary health-check conversations
+      isHealthCheck: extra.isHealthCheck,
     },
     createTime: Date.now(),
     modifyTime: Date.now(),

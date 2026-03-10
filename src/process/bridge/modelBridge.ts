@@ -12,6 +12,7 @@ import OpenAI from 'openai';
 import { isNewApiPlatform } from '@/common/utils/platformConstants';
 import { ipcBridge } from '../../common';
 import { ProcessConfig } from '../initStorage';
+import { ExtensionRegistry } from '@/extensions';
 import { BedrockClient, ListInferenceProfilesCommand } from '@aws-sdk/client-bedrock';
 
 /**
@@ -90,6 +91,34 @@ export function initModelBridge(): void {
         'M2-her', // Role-play & character-driven conversations
       ];
       return { success: true, data: { mode: minimaxModels } };
+    }
+
+    // 如果是 DashScope Coding Plan，验证 API Key 后返回支持的模型列表
+    // DashScope Coding Plan does not provide /v1/models endpoint (returns 404)
+    // Validate API key via /chat/completions probe, then return hardcoded list
+    if (base_url && isDashScopeCodingAPI(base_url)) {
+      const codingPlanModels = ['qwen3-coder-plus', 'qwen3-coder-next', 'qwen3.5-plus', 'qwen3-max-2026-01-23', 'glm-4.7', 'glm-5', 'MiniMax-M2.5', 'kimi-k2.5'];
+
+      // Validate the API key by probing the chat/completions endpoint
+      if (actualApiKey) {
+        try {
+          const probeUrl = `${base_url.replace(/\/+$/, '')}/chat/completions`;
+          const probeResponse = await fetch(probeUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${actualApiKey}` },
+            body: JSON.stringify({ model: codingPlanModels[0], messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+          });
+          if (probeResponse.status === 401) {
+            const errorData = await probeResponse.json().catch(() => ({}));
+            const errorMsg = errorData?.error?.message || errorData?.message || 'Invalid API key or token expired';
+            return { success: false, msg: errorMsg };
+          }
+        } catch {
+          // Network error during probe - still return model list, user will see error when chatting
+        }
+      }
+
+      return { success: true, data: { mode: codingPlanModels } };
     }
 
     // 如果是 Anthropic/Claude 平台，使用 Anthropic API 获取模型列表
@@ -410,10 +439,10 @@ export function initModelBridge(): void {
   ipcBridge.mode.getModelConfig.provider(() => {
     return ProcessConfig.get('model.config')
       .then((data) => {
-        if (!data) return [];
+        const sourceList = Array.isArray(data) ? data : [];
 
         // Handle migration from old IModel format to new IProvider format
-        return data.map((v: any, _index: number) => {
+        const normalizedProviders = sourceList.map((v: any) => {
           // Check if this is old format (has 'selectedModel' field) vs new format (has 'useModel')
           if ('selectedModel' in v && !('useModel' in v)) {
             // Migrate from old format
@@ -423,7 +452,7 @@ export function initModelBridge(): void {
               id: v.id || uuid(),
               capabilities: v.capabilities || [], // Add missing capabilities field
               contextLimit: v.contextLimit, // Keep existing contextLimit if present
-            };
+            } as IProvider;
             // Note: we don't delete selectedModel here as this is read-only migration
           }
 
@@ -432,8 +461,39 @@ export function initModelBridge(): void {
             ...v,
             id: v.id || uuid(),
             useModel: v.useModel || v.selectedModel || '', // Fallback for edge cases
-          };
+          } as IProvider;
         });
+
+        // Merge extension-contributed model providers (with user overrides from persisted config)
+        try {
+          const registry = ExtensionRegistry.getInstance();
+          const extensionProviders = registry.getModelProviders();
+          if (!extensionProviders || extensionProviders.length === 0) {
+            return normalizedProviders;
+          }
+
+          const extensionIds = new Set(extensionProviders.map((provider) => provider.id));
+          const userProviders = normalizedProviders.filter((provider) => !extensionIds.has(provider.id));
+
+          const mergedExtensionProviders: IProvider[] = extensionProviders.map((provider) => {
+            const existing = normalizedProviders.find((item) => item.id === provider.id);
+            return {
+              ...(existing || {}),
+              id: provider.id,
+              platform: provider.platform,
+              name: provider.name,
+              baseUrl: existing?.baseUrl || provider.baseUrl || '',
+              apiKey: existing?.apiKey || '',
+              model: Array.isArray(existing?.model) && existing.model.length > 0 ? existing.model : provider.models,
+              enabled: existing?.enabled ?? true,
+            } as IProvider;
+          });
+
+          return [...userProviders, ...mergedExtensionProviders];
+        } catch (error) {
+          console.warn('[ModelBridge] Failed to merge extension model providers:', error);
+          return normalizedProviders;
+        }
       })
       .catch(() => {
         return [] as IProvider[];
@@ -746,6 +806,43 @@ async function testOpenAIProtocol(baseUrl: string, apiKey: string, signal: Abort
     }
   }
 
+  // /models endpoints all failed (e.g. 404). Probe /chat/completions to confirm
+  // the endpoint is OpenAI-compatible even when it doesn't support model listing
+  // (DashScope Coding Plan, some proxies, etc.)
+  const chatProbeEndpoints = [
+    { url: `${baseUrl}/chat/completions`, path: '' },
+    { url: `${baseUrl}/v1/chat/completions`, path: '/v1' },
+  ];
+
+  for (const endpoint of chatProbeEndpoints) {
+    try {
+      const response = await fetch(endpoint.url, {
+        method: 'POST',
+        signal,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({ model: '_probe', messages: [{ role: 'user', content: '' }], max_tokens: 1 }),
+      });
+
+      if (response.status === 401) {
+        return { success: false, confidence: 70, error: 'Invalid API key for OpenAI protocol' };
+      }
+
+      const data = await response.json().catch((): null => null);
+      if (data?.error && typeof data.error === 'object' && 'message' in data.error) {
+        // OpenAI-style error response confirms the protocol
+        return { success: true, confidence: 75, fixedBaseUrl: endpoint.path ? `${baseUrl}${endpoint.path}` : undefined };
+      }
+      if (data?.choices && Array.isArray(data.choices)) {
+        return { success: true, confidence: 85, fixedBaseUrl: endpoint.path ? `${baseUrl}${endpoint.path}` : undefined };
+      }
+    } catch {
+      // Continue
+    }
+  }
+
   return { success: false, confidence: 0, error: 'Not an OpenAI-compatible API endpoint' };
 }
 
@@ -923,6 +1020,23 @@ function isMiniMaxAPI(baseUrl: string): boolean {
     // 精确匹配 minimaxi.com、minimax.io 或其子域名
     // Exact match minimaxi.com, minimax.io or their subdomains
     return hostname === 'minimaxi.com' || hostname.endsWith('.minimaxi.com') || hostname === 'minimax.io' || hostname.endsWith('.minimax.io');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 检测是否为 DashScope Coding Plan API
+ * Check if it's DashScope Coding Plan API (coding.dashscope.aliyuncs.com or coding-intl.dashscope.aliyuncs.com)
+ *
+ * DashScope Coding Plan 不提供 /v1/models 端点（返回 404），需要使用预设模型列表
+ * DashScope Coding Plan does not provide /v1/models endpoint (returns 404), needs hardcoded model list
+ */
+function isDashScopeCodingAPI(baseUrl: string): boolean {
+  try {
+    const url = new URL(baseUrl);
+    const hostname = url.hostname.toLowerCase();
+    return hostname === 'coding.dashscope.aliyuncs.com' || hostname === 'coding-intl.dashscope.aliyuncs.com';
   } catch {
     return false;
   }

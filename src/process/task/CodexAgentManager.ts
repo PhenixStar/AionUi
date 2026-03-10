@@ -12,9 +12,11 @@ import { CodexSessionManager } from '@/agent/codex/handlers/CodexSessionManager'
 import type { ICodexMessageEmitter } from '@/agent/codex/messaging/CodexMessageEmitter';
 import { channelEventBus } from '@/channels/agent/ChannelEventBus';
 import { ipcBridge } from '@/common';
-import type { IConfirmation, TMessage } from '@/common/chatLib';
+import type { CronMessageMeta, IConfirmation, TMessage } from '@/common/chatLib';
 import { transformMessage } from '@/common/chatLib';
-import type { CodexAgentManagerData, FileChange } from '@/common/codex/types';
+import type { CodexAgentManagerData } from '@/common/codex/types';
+import { DEFAULT_CODEX_MODELS, DEFAULT_CODEX_MODEL_ID } from '@/common/codex/codexModels';
+import type { AcpModelInfo } from '@/types/acpTypes';
 import { PERMISSION_DECISION_MAP } from '@/common/codex/types/permissionTypes';
 import { mapPermissionDecision } from '@/common/codex/utils';
 import { AIONUI_FILES_MARKER } from '@/common/constants';
@@ -34,6 +36,12 @@ const APP_CLIENT_NAME = getConfiguredAppClientName();
 const APP_CLIENT_VERSION = getConfiguredAppClientVersion();
 const CODEX_MCP_PROTOCOL_VERSION = getConfiguredCodexMcpProtocolVersion();
 
+/**
+ * @deprecated Legacy Codex agent manager. New Codex conversations are created
+ * through ACP protocol and handled by {@link AcpAgentManager}.
+ * This class is only kept for backward compatibility with existing sessions
+ * that were created before the ACP migration.
+ */
 class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implements ICodexMessageEmitter {
   workspace?: string;
   agent!: CodexAgent; // Initialized in bootstrap promise
@@ -44,6 +52,12 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
   /** Current session mode for approval behavior / 当前会话模式（影响审批行为） */
   private currentMode: string = 'default';
 
+  /** Cached model name from session_configured event */
+  private currentModelName: string | null = null;
+
+  /** User-selected model before session creation */
+  private selectedModel: string | null = null;
+
   constructor(data: CodexAgentManagerData) {
     // Do not fork a worker for Codex; we run the agent in-process now
     super('codex', data);
@@ -52,6 +66,7 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
     this.options = data; // 保存原始数据以便后续使用 / Save original data for later use
     this.status = 'pending';
     this.currentMode = data.sessionMode || 'default';
+    this.selectedModel = data.codexModel || null;
 
     this.initAgent(data);
   }
@@ -194,7 +209,7 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
     }
   }
 
-  async sendMessage(data: { content: string; files?: string[]; msg_id?: string }) {
+  async sendMessage(data: { content: string; files?: string[]; msg_id?: string; cronMeta?: CronMessageMeta }) {
     cronBusyGuard.setProcessing(this.conversation_id, true);
     // Set status to running when message is being processed
     this.status = 'running';
@@ -210,10 +225,24 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
           type: 'text',
           position: 'right',
           conversation_id: this.conversation_id,
-          content: { content: data.content },
+          content: {
+            content: data.content,
+            ...(data.cronMeta && { cronMeta: data.cronMeta }),
+          },
           createdAt: Date.now(),
         };
         addMessage(this.conversation_id, userMessage);
+        // Emit user_content IPC for cron messages so the frontend can display them
+        // even if the component mounts after the DB save but before the DB load completes.
+        if (data.cronMeta) {
+          const userResponseMessage: IResponseMessage = {
+            type: 'user_content',
+            conversation_id: this.conversation_id,
+            msg_id: data.msg_id,
+            data: { content: userMessage.content.content, cronMeta: data.cronMeta },
+          };
+          ipcBridge.codexConversation.responseStream.emit(userResponseMessage);
+        }
       }
 
       // 处理文件引用 - 参考 ACP 的文件引用处理
@@ -230,7 +259,7 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
           enabledSkills: this.options.enabledSkills,
         });
 
-        const result = await this.agent.newSession(this.workspace, processedContent);
+        const result = await this.agent.newSession(this.workspace, processedContent, this.selectedModel || undefined);
 
         // Session created successfully - Codex will send session_configured event automatically
         // Note: setProcessing(false) is called in CodexMessageProcessor.processTaskComplete
@@ -279,6 +308,36 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
       ipcBridge.codexConversation.responseStream.emit(message);
       throw e;
     }
+  }
+
+  /**
+   * Get model info for UI display (always read-only).
+   * Model selection happens on the Guid page; the conversation page only displays the result.
+   * - Before session_configured: show selectedModel (from Guid page) or default
+   * - After session_configured: show the actual model returned by Codex CLI
+   */
+  getModelInfo(): AcpModelInfo | null {
+    if (this.currentModelName) {
+      // Post session_configured: show actual model from CLI
+      return {
+        source: 'models',
+        currentModelId: this.currentModelName,
+        currentModelLabel: this.currentModelName,
+        canSwitch: false,
+        availableModels: [],
+      };
+    }
+
+    // Pre session_configured: show the model selected on Guid page
+    const currentId = this.selectedModel || DEFAULT_CODEX_MODEL_ID;
+    const currentModel = DEFAULT_CODEX_MODELS.find((m) => m.id === currentId);
+    return {
+      source: 'models',
+      currentModelId: currentId,
+      currentModelLabel: currentModel?.label || currentId,
+      canSwitch: false,
+      availableModels: [],
+    };
   }
 
   getMode(): { mode: string; initialized: boolean } {
@@ -353,11 +412,8 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
       this.storeApprovalDecision(callId, decision);
     }
 
-    // Apply patch changes if available and approved
-    const changes = this.agent.getEventHandler().getToolHandlers().getPatchChanges(callId);
-    if (changes && isApproved) {
-      await this.applyPatchChanges(callId, changes);
-    }
+    // IMPORTANT: Codex CLI is the single writer for patch application.
+    // Do not apply patch changes locally before sending approval.
 
     // Normalize call id back to server's codex_call_id
     // Handle the new unified permission_ prefix as well as legacy prefixes
@@ -396,30 +452,6 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
     if (patchChanges) {
       const files = Object.keys(patchChanges);
       this.agent.storePatchApproval(files, decision);
-    }
-  }
-
-  private async applyPatchChanges(callId: string, changes: Record<string, FileChange>): Promise<void> {
-    try {
-      // 使用文件操作处理器来应用更改 - 参考 ACP 的批量操作
-      await this.agent.getFileOperationHandler().applyBatchChanges(changes);
-
-      // 发送成功事件
-      this.agent.getSessionManager().emitSessionEvent('patch_applied', {
-        callId,
-        changeCount: Object.keys(changes).length,
-        files: Object.keys(changes),
-      });
-
-      // Patch changes applied successfully
-    } catch (error) {
-      // 发送失败事件
-      this.agent.getSessionManager().emitSessionEvent('patch_failed', {
-        callId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      throw error;
     }
   }
 
@@ -528,6 +560,17 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
   emitAndPersistMessage(message: IResponseMessage, persist: boolean = true): void {
     message.conversation_id = this.conversation_id;
 
+    // Intercept codex_model_info: cache model name, emit to frontend, skip DB persistence
+    if (message.type === 'codex_model_info') {
+      const modelData = message.data as { model: string };
+      if (modelData?.model) {
+        this.currentModelName = modelData.model;
+      }
+      ipcBridge.codexConversation.responseStream.emit(message);
+      channelEventBus.emitAgentMessage(this.conversation_id, message);
+      return;
+    }
+
     // Mark as finished when content is output (visible to user)
     // Codex uses: content, agent_status, codex_tool_call
     const contentTypes = ['content', 'agent_status', 'codex_tool_call'];
@@ -586,15 +629,8 @@ class CodexAgentManager extends BaseAgentManager<CodexAgentManagerData> implemen
       // Clean up pending confirmation tracking
       this.agent.getEventHandler().getToolHandlers().removePendingConfirmation(data.callId);
 
-      // For edit actions, apply patch changes asynchronously (fire-and-forget)
-      if (data.action === 'edit') {
-        const changes = this.agent.getEventHandler().getToolHandlers().getPatchChanges(data.callId);
-        if (changes) {
-          void this.applyPatchChanges(data.callId, changes).catch((err) => {
-            console.error('[CodexAgentManager] Failed to apply patch changes during auto-approve:', err);
-          });
-        }
-      }
+      // IMPORTANT: Do not apply patch changes locally in auto-approve mode.
+      // Let Codex CLI apply changes after approval response.
 
       // Send approval response to CLI (synchronous write to stdin)
       this.agent.respondElicitation(origCallId, 'approved');

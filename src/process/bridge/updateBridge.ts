@@ -11,6 +11,7 @@ import { app } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import semver from 'semver';
+import { autoUpdaterService } from '../services/autoUpdaterService';
 
 type GitHubReleaseApiAsset = {
   name: string;
@@ -29,6 +30,12 @@ type GitHubReleaseApi = {
   draft: boolean;
   assets?: GitHubReleaseApiAsset[];
 };
+
+/** Parameters for auto-update check via electron-updater */
+interface AutoUpdateCheckParams {
+  /** Whether to include prerelease/dev builds in update check */
+  includePrerelease?: boolean;
+}
 
 const DEFAULT_REPO = 'iOfficeAI/AionUi';
 const DEFAULT_USER_AGENT = 'AionUi';
@@ -56,22 +63,53 @@ const mapAsset = (asset: GitHubReleaseApiAsset): GitHubReleaseAsset => ({
   contentType: asset.content_type,
 });
 
-const getPlatformHints = () => {
-  const platform = process.platform;
-  const arch = process.arch;
+type RuntimePlatformInfo = {
+  platform: NodeJS.Platform;
+  arch: string;
+};
 
-  const archHints = arch === 'arm64' ? ['arm64', 'aarch64'] : ['x64', 'x86_64', 'amd64'];
+type CanonicalArch = 'x64' | 'arm64' | 'ia32';
+
+const normalizeArch = (arch: string): CanonicalArch => {
+  if (arch === 'arm64') return 'arm64';
+  if (arch === 'ia32' || arch === 'x32') return 'ia32';
+  return 'x64';
+};
+
+const detectAssetArchs = (nameLower: string): Set<CanonicalArch> => {
+  const detected = new Set<CanonicalArch>();
+
+  if (/\b(arm64|aarch64)\b/.test(nameLower)) detected.add('arm64');
+  if (/\b(x64|x86_64|amd64)\b/.test(nameLower)) detected.add('x64');
+
+  const hasX86Token = /\bx86\b/.test(nameLower) && !/\bx86[_-]?64\b/.test(nameLower);
+  if (/\b(ia32|x32|32bit)\b/.test(nameLower) || hasX86Token) detected.add('ia32');
+
+  return detected;
+};
+
+const getPlatformHints = (runtime: RuntimePlatformInfo = { platform: process.platform, arch: process.arch }) => {
+  const platform = runtime.platform;
+  const arch = runtime.arch;
+  const normalizedArch = normalizeArch(arch);
+
+  const archHints = normalizedArch === 'arm64' ? ['arm64', 'aarch64'] : normalizedArch === 'ia32' ? ['ia32', 'x86', 'x32', '32bit'] : ['x64', 'x86_64', 'amd64'];
 
   // electron-builder artifact names often include one of these
   const platformHints = platform === 'win32' ? ['win', 'win32', 'windows'] : platform === 'darwin' ? ['mac', 'darwin', 'osx'] : ['linux'];
 
-  return { platform, arch, archHints, platformHints };
+  return { platform, arch, normalizedArch, archHints, platformHints };
 };
 
-const scoreAsset = (asset: GitHubReleaseAsset): number => {
-  const { platform, archHints, platformHints } = getPlatformHints();
+const scoreAsset = (asset: GitHubReleaseAsset, runtime?: RuntimePlatformInfo): number => {
+  const { platform, normalizedArch, archHints, platformHints } = getPlatformHints(runtime);
   const nameLower = asset.name.toLowerCase();
   const ext = path.extname(asset.name);
+
+  const detectedArchs = detectAssetArchs(nameLower);
+  if (detectedArchs.size > 0 && !detectedArchs.has(normalizedArch)) {
+    return -1;
+  }
 
   let score = 0;
 
@@ -80,6 +118,7 @@ const scoreAsset = (asset: GitHubReleaseAsset): number => {
 
   // Arch match
   if (archHints.some((hint) => nameLower.includes(hint))) score += 10;
+  if (detectedArchs.has(normalizedArch)) score += 15;
 
   // Prefer installer formats per platform
   if (platform === 'win32') {
@@ -99,10 +138,15 @@ const scoreAsset = (asset: GitHubReleaseAsset): number => {
   return score;
 };
 
-const pickRecommendedAsset = (assets: GitHubReleaseAsset[]): GitHubReleaseAsset | undefined => {
+export const pickRecommendedAsset = (assets: GitHubReleaseAsset[], runtime?: RuntimePlatformInfo): GitHubReleaseAsset | undefined => {
   if (!assets.length) return undefined;
-  const scored = [...assets].sort((a, b) => scoreAsset(b) - scoreAsset(a));
-  return scored[0];
+
+  const scored = assets
+    .map((asset) => ({ asset, score: scoreAsset(asset, runtime) }))
+    .filter((item) => item.score >= 0)
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.asset;
 };
 
 const resolveRepo = (requestRepo?: string): string => {
@@ -357,6 +401,17 @@ const startDownloadInBackground = async (downloadId: string, url: string, filePa
   }
 };
 
+/**
+ * Create a status broadcast callback that sends updates via ipcBridge.autoUpdate.status.emit.
+ * This is a pure emitter: it does not bind to any specific window.
+ * The ipcBridge channel broadcasts to all renderer listeners, so no window guard is needed here.
+ */
+export function createAutoUpdateStatusBroadcast(): (status: import('../services/autoUpdaterService').AutoUpdateStatus) => void {
+  return (status) => {
+    ipcBridge.autoUpdate.status.emit(status);
+  };
+}
+
 export function initUpdateBridge(): void {
   ipcBridge.update.check.provider(async (params): Promise<{ success: boolean; data?: UpdateCheckResult; msg?: string }> => {
     try {
@@ -436,6 +491,55 @@ export function initUpdateBridge(): void {
       return Promise.resolve({ success: true, data: { downloadId, filePath: targetPath } });
     } catch (err: unknown) {
       return Promise.resolve({ success: false, msg: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Auto-updater IPC handlers (electron-updater)
+  ipcBridge.autoUpdate.check.provider(async (params: AutoUpdateCheckParams): Promise<{ success: boolean; data?: { updateInfo?: { version: string; releaseDate?: string; releaseNotes?: string } }; msg?: string }> => {
+    try {
+      // Set prerelease preference before checking
+      const includePrerelease = Boolean(params?.includePrerelease);
+      autoUpdaterService.setAllowPrerelease(includePrerelease);
+
+      const result = await autoUpdaterService.checkForUpdates();
+      if (result.success && result.updateInfo) {
+        // Only report update when the remote version is actually newer than the current version.
+        // electron-updater's checkForUpdates() always returns updateInfo regardless of availability.
+        const currentVersion = app.getVersion();
+        if (!semver.gt(result.updateInfo.version, currentVersion)) {
+          return { success: true, data: {} };
+        }
+        return {
+          success: true,
+          data: {
+            updateInfo: {
+              version: result.updateInfo.version,
+              releaseDate: result.updateInfo.releaseDate,
+              releaseNotes: typeof result.updateInfo.releaseNotes === 'string' ? result.updateInfo.releaseNotes : undefined,
+            },
+          },
+        };
+      }
+      return { success: result.success, msg: result.error };
+    } catch (err: unknown) {
+      return { success: false, msg: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcBridge.autoUpdate.download.provider(async (): Promise<{ success: boolean; msg?: string }> => {
+    try {
+      const result = await autoUpdaterService.downloadUpdate();
+      return { success: result.success, msg: result.error };
+    } catch (err: unknown) {
+      return { success: false, msg: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  ipcBridge.autoUpdate.quitAndInstall.provider(async (): Promise<void> => {
+    try {
+      autoUpdaterService.quitAndInstall();
+    } catch (err: unknown) {
+      console.error('quitAndInstall failed:', err);
     }
   });
 }

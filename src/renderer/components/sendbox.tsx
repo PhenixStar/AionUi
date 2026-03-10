@@ -5,10 +5,15 @@
  */
 
 import { useInputFocusRing } from '@/renderer/hooks/useInputFocusRing';
+import SlashCommandMenu, { type SlashCommandMenuItem } from '@/renderer/components/SlashCommandMenu';
+import { useSlashCommandController } from '@/renderer/hooks/useSlashCommandController';
+import { useLayoutContext } from '@/renderer/context/LayoutContext';
 import { usePreviewContext } from '@/renderer/pages/conversation/preview';
+import { blurActiveElement, shouldBlockMobileInputFocus } from '@/renderer/utils/focus';
 import { Button, Input, Message, Tag } from '@arco-design/web-react';
 import { ArrowUp, CloseSmall } from '@icon-park/react';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { SlashCommandItem } from '@/common/slash/types';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useCompositionInput } from '../hooks/useCompositionInput';
 import { useDragUpload } from '../hooks/useDragUpload';
@@ -38,7 +43,11 @@ const SendBox: React.FC<{
   defaultMultiLine?: boolean;
   lockMultiLine?: boolean;
   sendButtonPrefix?: React.ReactNode;
-}> = ({ onSend, onStop, prefix, className, loading, tools, disabled, placeholder, value: input = '', onChange: setInput = constVoid, onFilesAdded, supportedExts = allSupportedExts, defaultMultiLine = false, lockMultiLine = false, sendButtonPrefix }) => {
+  slashCommands?: SlashCommandItem[];
+  onSlashBuiltinCommand?: (name: string) => void;
+}> = ({ onSend, onStop, prefix, className, loading, tools, disabled, placeholder, value: input = '', onChange: setInput = constVoid, onFilesAdded, supportedExts = allSupportedExts, defaultMultiLine = false, lockMultiLine = false, sendButtonPrefix, slashCommands = [], onSlashBuiltinCommand }) => {
+  const layout = useLayoutContext();
+  const isMobile = layout?.isMobile ?? false;
   const { t } = useTranslation();
   const [isLoading, setIsLoading] = useState(false);
   const [isSingleLine, setIsSingleLine] = useState(!defaultMultiLine);
@@ -48,6 +57,7 @@ const SendBox: React.FC<{
   const containerRef = useRef<HTMLDivElement>(null);
   const singleLineWidthRef = useRef<number>(0);
   const measurementCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mobileUserFocusIntentUntilRef = useRef(0);
   const latestInputRef = useLatestRef(input);
   const setInputRef = useLatestRef(setInput);
 
@@ -82,6 +92,15 @@ const SendBox: React.FC<{
     }, 100);
     return () => clearTimeout(timer);
   }, []);
+
+  // 移动端挂载后主动清除焦点，拦截路由切换导致的非用户触发聚焦
+  useEffect(() => {
+    if (!isMobile) return;
+    const timer = setTimeout(() => {
+      blurActiveElement();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [isMobile]);
 
   // 检测是否单行
   // Detect whether to use single-line or multi-line mode
@@ -162,6 +181,56 @@ const SendBox: React.FC<{
 
   const [message, context] = Message.useMessage();
 
+  const builtinSlashCommands = useMemo<SlashCommandItem[]>(() => {
+    if (!onSlashBuiltinCommand) {
+      return [];
+    }
+    return [
+      {
+        name: 'open',
+        description: t('conversation.workspace.addFile', { defaultValue: 'Add File' }),
+        kind: 'builtin',
+        source: 'builtin',
+      },
+    ];
+  }, [onSlashBuiltinCommand, t]);
+
+  const mergedSlashCommands = useMemo(() => {
+    const map = new Map<string, SlashCommandItem>();
+    for (const command of builtinSlashCommands) {
+      map.set(command.name, command);
+    }
+    for (const command of slashCommands) {
+      if (!map.has(command.name)) {
+        map.set(command.name, command);
+      }
+    }
+    return Array.from(map.values());
+  }, [builtinSlashCommands, slashCommands]);
+
+  const slashController = useSlashCommandController({
+    input,
+    commands: mergedSlashCommands,
+    onExecuteBuiltin: (name) => {
+      onSlashBuiltinCommand?.(name);
+      setInput('');
+    },
+    onSelectTemplate: (name) => {
+      setInput(`/${name} `);
+    },
+  });
+
+  const slashMenuItems = useMemo<SlashCommandMenuItem[]>(
+    () =>
+      slashController.filteredCommands.map((command) => ({
+        key: command.name,
+        label: `/${command.name}`,
+        description: command.description,
+        badge: command.hint,
+      })),
+    [slashController.filteredCommands]
+  );
+
   // 使用共享的输入法合成处理
   const { compositionHandlers, createKeyDownHandler } = useCompositionInput();
 
@@ -189,10 +258,24 @@ const SendBox: React.FC<{
       }
     },
   });
+  const markMobileFocusIntent = useCallback(() => {
+    if (!isMobile) return;
+    mobileUserFocusIntentUntilRef.current = Date.now() + 1500;
+  }, [isMobile]);
+
   const handleInputFocus = useCallback(() => {
+    if (isMobile && Date.now() > mobileUserFocusIntentUntilRef.current) {
+      blurActiveElement();
+      return;
+    }
+    if (isMobile && shouldBlockMobileInputFocus()) {
+      blurActiveElement();
+      return;
+    }
+    mobileUserFocusIntentUntilRef.current = 0;
     handlePasteFocus();
     setIsInputFocused(true);
-  }, [handlePasteFocus]);
+  }, [handlePasteFocus, isMobile]);
   const handleInputBlur = useCallback(() => {
     setIsInputFocused(false);
   }, []);
@@ -214,11 +297,12 @@ const SendBox: React.FC<{
       finalMessage = input + snippetsHtml;
     }
 
+    // 立即清空输入框，避免异步 onSend 完成后覆盖用户新输入
+    // Clear input immediately to prevent async onSend completion from overwriting new user input
+    setInput('');
+    clearDomSnippets();
+
     onSend(finalMessage)
-      .then(() => {
-        setInput('');
-        clearDomSnippets(); // 发送后清除 DOM 片段 / Clear DOM snippets after sending
-      })
       .catch(() => {})
       .finally(() => {
         setIsLoading(false);
@@ -234,11 +318,33 @@ const SendBox: React.FC<{
     }
   };
 
+  // Calculate button disabled state and style
+  const isButtonDisabled = disabled || (!input.trim() && domSnippets.length === 0);
+  const buttonStyle = {
+    backgroundColor: isButtonDisabled ? undefined : '#000000',
+    borderColor: isButtonDisabled ? undefined : '#000000',
+  };
+
+  // Reusable send button component
+  const sendButton = (
+    <Button
+      shape='circle'
+      type='primary'
+      disabled={isButtonDisabled}
+      className='send-button-custom'
+      style={buttonStyle}
+      icon={<ArrowUp theme='filled' size='14' fill='white' strokeWidth={5} />}
+      onClick={() => {
+        sendMessageHandler();
+      }}
+    />
+  );
+
   return (
     <div className={className}>
       <div
         ref={containerRef}
-        className={`relative p-16px border-3 b bg-dialog-fill-0 b-solid rd-20px flex flex-col overflow-hidden ${isFileDragging ? 'b-dashed' : ''}`}
+        className={`relative p-16px border-3 b bg-dialog-fill-0 b-solid rd-20px flex flex-col ${slashController.isOpen ? 'overflow-visible' : 'overflow-hidden'} ${isFileDragging ? 'b-dashed' : ''}`}
         style={{
           transition: 'box-shadow 0.25s ease, border-color 0.25s ease',
           ...(isFileDragging
@@ -255,6 +361,25 @@ const SendBox: React.FC<{
         }}
         {...dragHandlers}
       >
+        {slashController.isOpen && (
+          <div className='absolute left-12px right-12px bottom-[calc(100%+8px)] z-70'>
+            <SlashCommandMenu
+              title={t('messages.slash.title', { defaultValue: 'Commands' })}
+              hint={t('messages.slash.hint', { defaultValue: 'Type / to open command menu' })}
+              items={slashMenuItems}
+              activeIndex={slashController.activeIndex}
+              loading={false}
+              onHoverItem={slashController.setActiveIndex}
+              onSelectItem={(item) => {
+                const targetIndex = slashController.filteredCommands.findIndex((command) => command.name === item.key);
+                if (targetIndex >= 0) {
+                  slashController.onSelectByIndex(targetIndex);
+                }
+              }}
+              emptyText={t('messages.slash.empty', { defaultValue: 'No commands found' })}
+            />
+          </div>
+        )}
         <div style={{ width: '100%' }}>
           {prefix}
           {context}
@@ -270,13 +395,13 @@ const SendBox: React.FC<{
           )}
         </div>
         <div className={isSingleLine ? 'flex items-center gap-2 w-full min-w-0 overflow-hidden' : 'w-full overflow-hidden'}>
-          {isSingleLine && <div className='flex-shrink-0 sendbox-tools'>{tools}</div>}
+          {isSingleLine && <div className={isMobile ? 'sendbox-tools sendbox-tools-scroll-mobile' : 'flex-shrink-0 sendbox-tools'}>{tools}</div>}
           <Input.TextArea
-            autoFocus
+            autoFocus={!isMobile}
             disabled={disabled}
             value={input}
             placeholder={placeholder}
-            className='pl-0 pr-0 !b-none focus:shadow-none m-0 !bg-transparent !focus:bg-transparent !hover:bg-transparent lh-[20px] !resize-none text-14px'
+            className={`pl-0 pr-0 !b-none focus:shadow-none m-0 !bg-transparent !focus:bg-transparent !hover:bg-transparent lh-[20px] !resize-none text-14px ${isMobile ? 'sendbox-input--mobile' : ''}`}
             style={{
               width: isSingleLine ? 'auto' : '100%',
               flex: isSingleLine ? 1 : 'none',
@@ -298,47 +423,27 @@ const SendBox: React.FC<{
               setInput(v);
             }}
             onPaste={onPaste}
+            onTouchStart={markMobileFocusIntent}
+            onMouseDown={markMobileFocusIntent}
             onFocus={handleInputFocus}
             onBlur={handleInputBlur}
             {...compositionHandlers}
             autoSize={isSingleLine ? false : { minRows: 1, maxRows: 10 }}
-            onKeyDown={createKeyDownHandler(sendMessageHandler)}
+            onKeyDown={createKeyDownHandler(sendMessageHandler, slashController.onKeyDown)}
           ></Input.TextArea>
           {isSingleLine && (
             <div className='flex items-center gap-2'>
               {sendButtonPrefix}
-              {isLoading || loading ? (
-                <Button shape='circle' type='secondary' className='bg-animate' icon={<div className='mx-auto size-12px bg-6'></div>} onClick={stopHandler}></Button>
-              ) : (
-                <Button
-                  shape='circle'
-                  type='primary'
-                  icon={<ArrowUp theme='outline' size='14' fill='white' strokeWidth={2} />}
-                  onClick={() => {
-                    sendMessageHandler();
-                  }}
-                />
-              )}
+              {isLoading || loading ? <Button shape='circle' type='secondary' className='bg-animate' icon={<div className='mx-auto size-12px bg-6'></div>} onClick={stopHandler}></Button> : sendButton}
             </div>
           )}
         </div>
         {!isSingleLine && (
           <div className='flex items-center justify-between gap-2 w-full'>
-            <div className='sendbox-tools'>{tools}</div>
+            <div className={isMobile ? 'sendbox-tools sendbox-tools-scroll-mobile' : 'sendbox-tools'}>{tools}</div>
             <div className='flex items-center gap-2'>
               {sendButtonPrefix}
-              {isLoading || loading ? (
-                <Button shape='circle' type='secondary' className='bg-animate' icon={<div className='mx-auto size-12px bg-6'></div>} onClick={stopHandler}></Button>
-              ) : (
-                <Button
-                  shape='circle'
-                  type='primary'
-                  icon={<ArrowUp theme='outline' size='14' fill='white' strokeWidth={2} />}
-                  onClick={() => {
-                    sendMessageHandler();
-                  }}
-                />
-              )}
+              {isLoading || loading ? <Button shape='circle' type='secondary' className='bg-animate' icon={<div className='mx-auto size-12px bg-6'></div>} onClick={stopHandler}></Button> : sendButton}
             </div>
           </div>
         )}

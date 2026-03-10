@@ -5,6 +5,7 @@
  */
 
 import { ConfigStorage, type ICssTheme } from '@/common/storage';
+import { ipcBridge } from '@/common';
 import { uuid } from '@/common/utils';
 import { Button, Message, Modal } from '@arco-design/web-react';
 import { EditTwo, Plus, CheckOne } from '@icon-park/react';
@@ -13,6 +14,8 @@ import { useTranslation } from 'react-i18next';
 import CssThemeModal from './CssThemeModal';
 import { PRESET_THEMES, DEFAULT_THEME_ID } from './presets';
 import { BACKGROUND_BLOCK_START, injectBackgroundCssBlock } from './backgroundUtils';
+import { setExtensionThemesCache } from '@/renderer/utils/themeCssSync';
+import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
 
 const ensureBackgroundCss = <T extends { id?: string; cover?: string; css: string }>(theme: T): T => {
   // 跳过 Default 主题，不注入背景图 CSS / Skip Default theme, do not inject background CSS
@@ -35,6 +38,10 @@ const normalizeUserThemes = (themes: ICssTheme[]): { normalized: ICssTheme[]; up
     return nextTheme;
   });
   return { normalized, updated };
+};
+
+const dispatchCustomCssUpdated = (css: string) => {
+  window.dispatchEvent(new CustomEvent('custom-css-updated', { detail: { customCss: css } }));
 };
 
 /**
@@ -67,12 +74,56 @@ const CssThemeSettings: React.FC = () => {
         // 对预设主题也应用背景图 CSS 处理 / Apply background CSS processing to preset themes as well
         const normalizedPresets = PRESET_THEMES.map((theme) => ensureBackgroundCss(theme));
 
-        // 合并预设主题和用户主题 / Merge preset themes with user themes
-        const allThemes = [...normalizedPresets, ...normalized.filter((t) => !t.isPreset)];
+        // 加载扩展主题 / Load extension-contributed themes
+        let extensionThemes: ICssTheme[] = [];
+        try {
+          const loadedExtensionThemes = await ipcBridge.extensions.getThemes.invoke();
+          // Normalize extension asset URLs for current runtime (Electron/WebUI)
+          extensionThemes = loadedExtensionThemes.map((theme) => ({
+            ...theme,
+            cover: resolveExtensionAssetUrl(theme.cover),
+          }));
+          // Update cache so themeCssSync can resolve extension themes without async IPC
+          setExtensionThemesCache(extensionThemes);
+        } catch {
+          // Extensions not available (e.g., WebUI mode or not initialized yet)
+        }
+
+        // 合并预设主题、扩展主题和用户主题，按 ID 去重（先出现的优先）
+        // Merge preset, extension, and user themes; deduplicate by ID (first occurrence wins)
+        const seenIds = new Set<string>();
+        const allThemes: ICssTheme[] = [];
+        for (const theme of [...normalizedPresets, ...extensionThemes, ...normalized.filter((t) => !t.isPreset)]) {
+          if (!theme?.id || seenIds.has(theme.id)) continue;
+          seenIds.add(theme.id);
+          allThemes.push(theme);
+        }
+
+        const resolvedActiveId = activeId || DEFAULT_THEME_ID;
+        const activeTheme = allThemes.find((theme) => theme.id === resolvedActiveId);
+
+        // 如果激活主题不存在（扩展被移除等），回退到默认主题
+        // If active theme no longer exists (extension removed etc.), fall back to default
+        let effectiveActiveId = resolvedActiveId;
+        let expectedCss = activeTheme?.css || '';
+        if (!activeTheme && resolvedActiveId !== DEFAULT_THEME_ID) {
+          effectiveActiveId = DEFAULT_THEME_ID;
+          const defaultTheme = allThemes.find((t) => t.id === DEFAULT_THEME_ID);
+          expectedCss = defaultTheme?.css || '';
+          // Persist the fallback so we don't repeat this on every mount
+          await ConfigStorage.set('css.activeThemeId', effectiveActiveId);
+        }
 
         setThemes(allThemes);
-        // 如果没有保存的主题 ID，默认选择 default-theme / Default to default-theme if no saved theme ID
-        setActiveThemeId(activeId || DEFAULT_THEME_ID);
+        setActiveThemeId(effectiveActiveId);
+
+        // Self-heal potential split-brain state (activeThemeId != customCss) caused by partial IPC write failures.
+        const savedCustomCss = (await ConfigStorage.get('customCss')) || '';
+        if (savedCustomCss !== expectedCss) {
+          await ConfigStorage.set('customCss', expectedCss);
+          // Only dispatch when CSS actually changed to avoid redundant re-renders
+          dispatchCustomCssUpdated(expectedCss);
+        }
       } catch (error) {
         console.error('Failed to load CSS themes:', error);
       }
@@ -83,30 +134,51 @@ const CssThemeSettings: React.FC = () => {
   /**
    * 应用主题 CSS / Apply theme CSS
    */
-  const applyThemeCss = useCallback((css: string) => {
-    // 更新 customCss 存储并触发事件 / Update customCss storage and dispatch event
-    void ConfigStorage.set('customCss', css).catch((err) => {
-      console.error('Failed to save custom CSS:', err);
-    });
-    window.dispatchEvent(
-      new CustomEvent('custom-css-updated', {
-        detail: { customCss: css },
-      })
-    );
-  }, []);
+  // Serial queue to process theme changes in strict order without drops
+  const applyQueue = React.useRef<Promise<void>>(Promise.resolve());
 
+  const applyThemeCss = useCallback((css: string, themeId: string) => {
+    const task = async () => {
+      try {
+        // Queued Concurrent Writes: Not strictly atomic, but eliminates client-side async interleaving.
+        // True atomicity would require a single RPC/key batch in the main process.
+        await Promise.all([ConfigStorage.set('customCss', css), ConfigStorage.set('css.activeThemeId', themeId)]);
+
+        // Pessimistic UI Update - only updates if backend storage succeeded completely
+        setActiveThemeId(themeId);
+        dispatchCustomCssUpdated(css);
+      } catch (error) {
+        console.error('Failed to apply theme (IPC/Storage Error). Initiating source-of-truth recovery:', error);
+
+        // Recover state unconditionally from what is actually in storage
+        try {
+          const realId = (await ConfigStorage.get('css.activeThemeId')) || DEFAULT_THEME_ID;
+          const realCss = (await ConfigStorage.get('customCss')) || '';
+
+          // Unconditionally align UI state with the real storage state
+          setActiveThemeId(realId);
+          dispatchCustomCssUpdated(realCss);
+        } catch (syncError) {
+          console.error('Fallback sync failed:', syncError);
+        }
+        throw error;
+      }
+    };
+
+    applyQueue.current = applyQueue.current.then(task, task);
+    return applyQueue.current;
+  }, []);
   /**
    * 选择主题 / Select theme
    */
   const handleSelectTheme = useCallback(
     async (theme: ICssTheme) => {
       try {
-        setActiveThemeId(theme.id);
-        await ConfigStorage.set('css.activeThemeId', theme.id);
-        applyThemeCss(theme.css);
+        // Use queued, best-effort write function
+        await applyThemeCss(theme.css, theme.id);
         Message.success(t('settings.cssTheme.applied', { name: theme.name }));
       } catch (error) {
-        console.error('Failed to apply theme:', error);
+        // applyThemeCss internally handles the UI state recovery now.
         Message.error(t('settings.cssTheme.applyFailed'));
       }
     },
@@ -188,9 +260,8 @@ const CssThemeSettings: React.FC = () => {
 
             // 如果删除的是当前激活主题，清除激活状态 / If deleting active theme, clear active state
             if (activeThemeId === themeId) {
-              await ConfigStorage.set('css.activeThemeId', '');
-              setActiveThemeId('');
-              applyThemeCss('');
+              // 删除操作也使用强一致性的状态重置 / Use strongly consistent state reset for delete too
+              await applyThemeCss('', '');
             }
 
             setThemes(updatedThemes);
@@ -208,19 +279,24 @@ const CssThemeSettings: React.FC = () => {
   );
 
   return (
-    <div className='space-y-16px'>
+    <div className='space-y-12px'>
       {/* 标题栏 / Header */}
-      <div className='flex items-center justify-between'>
-        <span className='text-14px text-t-secondary'>{t('settings.cssTheme.selectOrCustomize')}</span>
-        <Button type='outline' size='small' className='rd-20px' icon={<Plus theme='outline' size='14' />} onClick={handleAddTheme}>
+      <div className='flex items-start md:items-center justify-between gap-8px flex-wrap'>
+        <span className='text-14px text-t-secondary leading-22px'>{t('settings.cssTheme.selectOrCustomize')}</span>
+        <Button type='outline' size='small' className='rd-18px h-34px px-14px !m-0' icon={<Plus theme='outline' size='14' />} onClick={handleAddTheme}>
           {t('settings.cssTheme.addManually')}
         </Button>
       </div>
 
       {/* 主题卡片列表 / Theme card list */}
-      <div className='flex flex-wrap gap-10px'>
+      <div
+        className='grid w-full gap-12px'
+        style={{
+          gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+        }}
+      >
         {themes.map((theme) => (
-          <div key={theme.id} className={`relative cursor-pointer rounded-12px overflow-hidden border-2 transition-all duration-200 w-180px h-112px ${activeThemeId === theme.id ? 'border-[var(--color-primary)]' : 'border-transparent hover:border-border-2'}`} style={theme.cover ? { backgroundImage: `url(${theme.cover})`, backgroundSize: '100% 100%', backgroundPosition: 'center', backgroundRepeat: 'no-repeat', backgroundColor: 'var(--fill-1)' } : { backgroundColor: 'var(--fill-1)' }} onClick={() => handleSelectTheme(theme)} onMouseEnter={() => setHoveredThemeId(theme.id)} onMouseLeave={() => setHoveredThemeId(null)}>
+          <div key={theme.id} className={`relative cursor-pointer rounded-12px overflow-hidden border-2 transition-all duration-200 h-112px w-full ${activeThemeId === theme.id ? 'border-[var(--color-primary)]' : 'border-transparent hover:border-border-2'}`} style={theme.cover ? { backgroundImage: `url(${theme.cover})`, backgroundSize: '100% 100%', backgroundPosition: 'center', backgroundRepeat: 'no-repeat', backgroundColor: 'var(--fill-1)' } : { backgroundColor: 'var(--fill-1)' }} onClick={() => handleSelectTheme(theme)} onMouseEnter={() => setHoveredThemeId(theme.id)} onMouseLeave={() => setHoveredThemeId(null)}>
             {/* 无封面时显示名称占位 / Show name placeholder when no cover */}
             {!theme.cover && (
               <div className='absolute inset-0 flex items-center justify-center'>

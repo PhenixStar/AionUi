@@ -50,9 +50,10 @@ interface TelegramConfigFormProps {
   pluginStatus: IChannelPluginStatus | null;
   modelSelection: GeminiModelSelection;
   onStatusChange: (status: IChannelPluginStatus | null) => void;
+  onTokenChange?: (token: string) => void;
 }
 
-const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, modelSelection, onStatusChange }) => {
+const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, modelSelection, onStatusChange, onTokenChange }) => {
   const { t } = useTranslation();
 
   const [telegramToken, setTelegramToken] = useState('');
@@ -65,7 +66,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, m
   const [authorizedUsers, setAuthorizedUsers] = useState<IChannelUser[]>([]);
 
   // Agent selection (used for Telegram conversations)
-  const [availableAgents, setAvailableAgents] = useState<Array<{ backend: AcpBackendAll; name: string; customAgentId?: string; isPreset?: boolean }>>([]);
+  const [availableAgents, setAvailableAgents] = useState<Array<{ backend: AcpBackendAll; name: string; customAgentId?: string; isPreset?: boolean; isExtension?: boolean }>>([]);
   const [selectedAgent, setSelectedAgent] = useState<{ backend: AcpBackendAll; name?: string; customAgentId?: string }>({ backend: 'gemini' });
 
   // Load pending pairings
@@ -111,7 +112,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, m
         const [agentsResp, saved] = await Promise.all([acpConversation.getAvailableAgents.invoke(), ConfigStorage.get('assistant.telegram.agent')]);
 
         if (agentsResp.success && agentsResp.data) {
-          const list = agentsResp.data.filter((a) => !a.isPreset).map((a) => ({ backend: a.backend, name: a.name, customAgentId: a.customAgentId, isPreset: a.isPreset }));
+          const list = agentsResp.data.filter((a) => !a.isPreset).map((a) => ({ backend: a.backend, name: a.name, customAgentId: a.customAgentId, isPreset: a.isPreset, isExtension: a.isExtension }));
           setAvailableAgents(list);
         }
 
@@ -135,7 +136,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, m
   const persistSelectedAgent = async (agent: { backend: AcpBackendAll; customAgentId?: string; name?: string }) => {
     try {
       await ConfigStorage.set('assistant.telegram.agent', agent);
-      await channel.syncChannelSettings.invoke({ platform: 'telegram', agent }).catch(() => {});
+      await channel.syncChannelSettings.invoke({ platform: 'telegram', agent }).catch((err) => console.warn('[TelegramConfig] syncChannelSettings failed:', err));
       Message.success(t('settings.assistant.agentSwitched', 'Agent switched successfully'));
     } catch (error) {
       console.error('[TelegramConfig] Failed to save agent:', error);
@@ -229,6 +230,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, m
     setTelegramToken(value);
     setTokenTested(false);
     setTestedBotUsername(null);
+    onTokenChange?.(value);
   };
 
   // Approve pairing
@@ -280,7 +282,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, m
   // Copy to clipboard
   const copyToClipboard = (text: string) => {
     void navigator.clipboard.writeText(text);
-    Message.success(t('common.copied', 'Copied to clipboard'));
+    Message.success(t('common.copySuccess', 'Copied'));
   };
 
   // Format timestamp
@@ -295,7 +297,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({ pluginStatus, m
   };
 
   const isGeminiAgent = selectedAgent.backend === 'gemini';
-  const agentOptions: Array<{ backend: AcpBackendAll; name: string; customAgentId?: string }> = availableAgents.length > 0 ? availableAgents : [{ backend: 'gemini', name: 'Gemini CLI' }];
+  const agentOptions: Array<{ backend: AcpBackendAll; name: string; customAgentId?: string; isExtension?: boolean }> = availableAgents.length > 0 ? availableAgents : [{ backend: 'gemini', name: 'Gemini CLI' }];
 
   return (
     <div className='flex flex-col gap-24px'>

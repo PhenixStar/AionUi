@@ -2,22 +2,133 @@
 
 /**
  * Simplified build script for AionUi
- * Coordinates Electron Forge (webpack) and electron-builder (packaging)
+ * Coordinates electron-vite (bundling) and electron-builder (packaging)
+ *
+ * Features:
+ * - Incremental builds: use --skip-vite to skip Vite compilation if out/ exists
+ * - Skip native rebuild: use --skip-native to skip native module rebuilding
+ * - Packaging only: use --pack-only to skip electron-builder distributable creation
  */
 
 const { execSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // DMG retry logic for macOS: detects DMG creation failures by checking artifacts
 // (.app exists but .dmg missing) and retries only the DMG step using
 // electron-builder --prepackaged with the .app path (not the parent directory).
 // This preserves full DMG styling (window size, icon positions, background)
-// while skipping the pack/sign steps.
 // Background: GitHub Actions macos-14 runners occasionally suffer from transient
 // "Device not configured" hdiutil errors (electron-builder#8415, actions/runner-images#12323).
 const DMG_RETRY_MAX = 3;
 const DMG_RETRY_DELAY_SEC = 30;
+
+// Incremental build: hash of source files to detect changes
+const INCREMENTAL_CACHE_FILE = 'out/.build-hash';
+
+function walkFiles(dir, acc = []) {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === 'node_modules' || entry.name === 'out' || entry.name === '.git') continue;
+      walkFiles(fullPath, acc);
+    } else if (entry.isFile()) {
+      acc.push(fullPath);
+    }
+  }
+  return acc;
+}
+
+function computeSourceHash() {
+  const hash = crypto.createHash('md5');
+  const rootDir = path.resolve(__dirname, '..');
+  const filesToHash = [
+    'package.json',
+    'package-lock.json',
+    'bun.lock',
+    'tsconfig.json',
+    'electron.vite.config.ts',
+    'electron-builder.yml',
+    'justfile',
+  ];
+
+  for (const file of filesToHash) {
+    const filePath = path.resolve(rootDir, file);
+    if (fs.existsSync(filePath)) {
+      const content = fs.readFileSync(filePath);
+      hash.update(file + ':');
+      hash.update(content);
+    }
+  }
+
+  const hashDirs = ['src', 'public', 'scripts'];
+  for (const dir of hashDirs) {
+    const dirPath = path.resolve(rootDir, dir);
+    if (!fs.existsSync(dirPath)) continue;
+
+    const files = walkFiles(dirPath)
+      .map((file) => path.relative(rootDir, file).replace(/\\/g, '/'))
+      .sort();
+
+    for (const relPath of files) {
+      const absolutePath = path.resolve(rootDir, relPath);
+      const stat = fs.statSync(absolutePath);
+      hash.update(relPath + ':');
+      hash.update(String(stat.size));
+      hash.update(String(stat.mtimeMs));
+    }
+  }
+
+  return hash.digest('hex');
+}
+
+function loadCachedHash() {
+  try {
+    const cacheFile = path.resolve(__dirname, '..', INCREMENTAL_CACHE_FILE);
+    if (fs.existsSync(cacheFile)) {
+      return fs.readFileSync(cacheFile, 'utf8').trim();
+    }
+  } catch {}
+  return null;
+}
+
+function saveCurrentHash(hash) {
+  try {
+    const cacheFile = path.resolve(__dirname, '..', INCREMENTAL_CACHE_FILE);
+    const viteDir = path.dirname(cacheFile);
+    if (!fs.existsSync(viteDir)) {
+      fs.mkdirSync(viteDir, { recursive: true });
+    }
+    fs.writeFileSync(cacheFile, hash);
+  } catch {}
+}
+
+function viteBuildExists() {
+  const outDir = path.resolve(__dirname, '../out');
+  const mainDir = path.join(outDir, 'main');
+  const rendererDir = path.join(outDir, 'renderer');
+
+  return fs.existsSync(path.join(mainDir, 'index.js')) &&
+         fs.existsSync(path.join(rendererDir, 'index.html'));
+}
+
+function shouldSkipViteBuild(skipViteFlag, forceFlag) {
+  if (forceFlag) return false;
+  if (skipViteFlag) return true;
+
+  // Auto-detect: skip if build exists and hash matches
+  const currentHash = computeSourceHash();
+  const cachedHash = loadCachedHash();
+
+  if (cachedHash && currentHash === cachedHash && viteBuildExists()) {
+    console.log('📦 Incremental build: Vite output unchanged, skipping compilation');
+    return true;
+  }
+
+  return false;
+}
 
 function cleanupDiskImages() {
   try {
@@ -58,6 +169,44 @@ function dmgExists(outDir) {
   }
 }
 
+function tryRemoveDir(targetDir) {
+  if (!fs.existsSync(targetDir)) return true;
+  try {
+    fs.rmSync(targetDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+    return true;
+  } catch (error) {
+    console.log(`❌ Failed to remove ${targetDir}: ${error.message}`);
+    return false;
+  }
+}
+
+function isProcessRunningWindows(imageName) {
+  if (process.platform !== 'win32') return false;
+  try {
+    const result = execSync(`tasklist /FI "IMAGENAME eq ${imageName}"`, { stdio: ['ignore', 'pipe', 'ignore'] });
+    return result.toString().toLowerCase().includes(imageName.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function killWindowsProcesses(imageNames) {
+  if (process.platform !== 'win32') return;
+  for (const name of imageNames) {
+    try {
+      execSync(`taskkill /F /IM ${name}`, { stdio: 'ignore' });
+    } catch {
+    }
+  }
+}
+
+function formatExecError(error) {
+  return [error?.message, error?.stdout?.toString?.(), error?.stderr?.toString?.()]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
 // Create DMG using electron-builder --prepackaged with .app path
 // This preserves DMG styling from electron-builder.yml (window size, icon positions, background)
 function createDmgWithPrepackaged(appDir, targetArch) {
@@ -66,8 +215,8 @@ function createDmgWithPrepackaged(appDir, targetArch) {
   const appPath = path.join(appDir, appName);
 
   execSync(
-    `npx electron-builder --mac dmg --${targetArch} --prepackaged "${appPath}" --publish=never`,
-    { stdio: 'inherit' }
+    `bunx electron-builder --mac dmg --${targetArch} --prepackaged "${appPath}" --publish=never`,
+    { stdio: 'inherit', shell: process.platform === 'win32' }
   );
 }
 
@@ -76,7 +225,7 @@ function buildWithDmgRetry(cmd, targetArch) {
   const outDir = path.resolve(__dirname, '../out');
 
   try {
-    execSync(cmd, { stdio: 'inherit' });
+    execSync(cmd, { stdio: 'inherit', shell: process.platform === 'win32' });
     return;
   } catch (error) {
     // On non-macOS or if .app doesn't exist, just throw
@@ -108,13 +257,50 @@ function buildWithDmgRetry(cmd, targetArch) {
   }
 }
 
+// Clean stale Windows packaging outputs from previous runs
+function cleanupWindowsPackOutput() {
+  const outDir = path.resolve(__dirname, '../out');
+  if (!fs.existsSync(outDir)) return;
+
+  const removed = [];
+  const winUnpackedDirRe = /^win(?:-[a-z0-9]+)?-unpacked$/i;
+  const winArtifactFileRe = /-win-[^.]+\.(?:exe|msi|zip|7z|blockmap)$/i;
+
+  for (const entry of fs.readdirSync(outDir, { withFileTypes: true })) {
+    const fullPath = path.join(outDir, entry.name);
+
+    if (entry.isDirectory() && winUnpackedDirRe.test(entry.name)) {
+      fs.rmSync(fullPath, { recursive: true, force: true });
+      removed.push(entry.name);
+      continue;
+    }
+
+    if (entry.isFile() && winArtifactFileRe.test(entry.name)) {
+      fs.rmSync(fullPath, { force: true });
+      removed.push(entry.name);
+    }
+  }
+
+  if (removed.length > 0) {
+    console.log(`🧹 Cleaned stale Windows outputs: ${removed.join(', ')}`);
+  }
+}
+
 // Parse command line arguments
 const args = process.argv.slice(2);
 const archList = ['x64', 'arm64', 'ia32', 'armv7l'];
+
+// Check for special flags
+const skipVite = args.includes('--skip-vite');
+const skipNative = args.includes('--skip-native');
+const packOnly = args.includes('--pack-only');
+const forceBuild = args.includes('--force');
+
 const builderArgs = args
   .filter(arg => {
-    // Filter out 'auto' and architecture flags (both --x64 and x64 formats)
+    // Filter out 'auto', architecture flags, and special flags
     if (arg === 'auto') return false;
+    if (arg === '--skip-vite' || arg === '--skip-native' || arg === '--pack-only' || arg === '--force') return false;
     if (archList.includes(arg)) return false;
     if (arg.startsWith('--') && archList.includes(arg.slice(2))) return false;
     return true;
@@ -183,93 +369,64 @@ if (archArgs.length > 1) {
 
 console.log(`🔨 Building for architecture: ${targetArch}`);
 console.log(`📋 Builder arguments: ${builderArgs || '(none)'}`);
+if (skipVite) console.log('⚡ --skip-vite: Will skip Vite compilation if output exists');
+if (skipNative) console.log('⚡ --skip-native: Will skip native module rebuilding');
+if (packOnly) console.log('⚡ --pack-only: Will skip electron-builder distributable creation');
+if (forceBuild) console.log('⚡ --force: Force full rebuild');
 
 const packageJsonPath = path.resolve(__dirname, '../package.json');
 
 try {
-  // 1. Ensure package.json main entry is correct for Forge
+  // 1. Ensure package.json main entry is correct for electron-vite
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-  if (packageJson.main !== '.webpack/main') {
-    packageJson.main = '.webpack/main';
+  if (packageJson.main !== './out/main/index.js') {
+    packageJson.main = './out/main/index.js';
     fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n');
   }
 
-  // 2. Run Forge to build webpack bundles with explicit architecture
-  console.log(`📦 Building ${targetArch}...`);
-  // Use cross-platform command: npm exec works on both Unix and Windows
-  execSync(`npm exec electron-forge -- package --arch=${targetArch}`, {
-    stdio: 'inherit',
-    env: {
-      ...process.env,
-      ELECTRON_BUILDER_ARCH: targetArch,
-      FORGE_SKIP_NATIVE_REBUILD: 'false'  // Ensure native modules are rebuilt during packaging
-    }
-  });
+  // 2. Check if we can skip Vite build (incremental build)
+  const skipViteBuild = shouldSkipViteBuild(skipVite, forceBuild);
 
-  // 3. Verify Forge output
-  const webpackDir = path.resolve(__dirname, '../.webpack');
-  if (!fs.existsSync(webpackDir)) {
-    throw new Error('Forge did not generate .webpack directory');
+  if (!skipViteBuild) {
+    // Run electron-vite to build all bundles (main + preload + renderer)
+    console.log(`📦 Building ${targetArch}...`);
+    execSync(`bunx electron-vite build`, {
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+      env: {
+        ...process.env,
+        ELECTRON_BUILDER_ARCH: targetArch,
+      }
+    });
+
+    // Save hash after successful build
+    saveCurrentHash(computeSourceHash());
+  } else {
+    console.log('📦 Using cached Vite build output');
   }
 
-  // Find the architecture-specific output or use default
-  const possibleDirs = [
-    path.join(webpackDir, targetArch),
-    path.join(webpackDir, buildMachineArch),
-    webpackDir
-  ];
-
-  let sourceDir = webpackDir;
-  for (const dir of possibleDirs) {
-    if (fs.existsSync(path.join(dir, 'main'))) {
-      sourceDir = dir;
-      break;
-    }
+  // 3. Verify electron-vite output
+  const outDir = path.resolve(__dirname, '../out');
+  if (!fs.existsSync(outDir)) {
+    throw new Error('electron-vite did not generate out/ directory');
   }
 
-  // 4. Ensure required directories exist for electron-builder
-  const ensureDir = (srcDir, destDir, name) => {
-    const src = path.join(srcDir, name);
-    const dest = path.join(webpackDir, name);
+  // 4. Validate output structure
+  const mainIndex = path.join(outDir, 'main', 'index.js');
+  const rendererIndex = path.join(outDir, 'renderer', 'index.html');
 
-    if (fs.existsSync(src) && src !== dest) {
-      if (fs.existsSync(dest)) {
-        fs.rmSync(dest, { recursive: true, force: true });
-      }
-
-      if (process.platform === 'win32') {
-        execSync(`xcopy "${src}" "${dest}" /E /I /H /Y /Q`, { stdio: 'inherit' });
-      } else {
-        execSync(`cp -r "${src}" "${dest}"`, { stdio: 'inherit' });
-      }
-    }
-  };
-
-  ensureDir(sourceDir, webpackDir, 'main');
-  ensureDir(sourceDir, webpackDir, 'renderer');
-  if (sourceDir !== webpackDir && fs.existsSync(path.join(sourceDir, 'native_modules'))) {
-    ensureDir(sourceDir, webpackDir, 'native_modules');
-  }
-
-  // 4.1 Validate renderer entry exists (critical for packaged app)
-  const rendererIndex = path.join(webpackDir, 'renderer', 'main_window', 'index.html');
-  if (!fs.existsSync(rendererIndex)) {
-    const topLevelDirs = fs.readdirSync(webpackDir, { withFileTypes: true })
-      .filter(entry => entry.isDirectory())
-      .map(entry => entry.name);
-
-    for (const dirName of topLevelDirs) {
-      const candidate = path.join(webpackDir, dirName, 'renderer', 'main_window', 'index.html');
-      if (fs.existsSync(candidate)) {
-        console.log(`🔁 Found renderer entry under .webpack/${dirName}, copying to .webpack/renderer...`);
-        ensureDir(path.join(webpackDir, dirName), webpackDir, 'renderer');
-        break;
-      }
-    }
+  if (!fs.existsSync(mainIndex)) {
+    throw new Error('Missing main entry: out/main/index.js');
   }
 
   if (!fs.existsSync(rendererIndex)) {
-    throw new Error('Missing renderer entry: .webpack/renderer/main_window/index.html');
+    throw new Error('Missing renderer entry: out/renderer/index.html');
+  }
+
+  // If --pack-only, skip electron-builder distributable creation
+  if (packOnly) {
+    console.log('✅ Package completed! (skipped distributable creation)');
+    return;
   }
 
   // 5. 运行 electron-builder 生成分发包（DMG/ZIP/EXE等）
@@ -277,6 +434,16 @@ try {
   // Always disable auto-publish to avoid electron-builder's implicit tag-based publishing
   // Publishing is handled by a separate release job in CI
   const publishArg = '--publish=never';
+
+  // Set compression level based on environment
+  // 7za -mx accepts numeric values: 0 (store) to 9 (ultra)
+  // CI builds use 9 (maximum) for smallest size
+  // Local builds use 7 (normal) for 30-50% faster ASAR packing
+  const isCI = process.env.CI === 'true';
+  if (!process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL) {
+    process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL = isCI ? '9' : '7';
+  }
+  console.log(`📦 Compression level: ${process.env.ELECTRON_BUILDER_COMPRESSION_LEVEL} (${isCI ? 'CI build' : 'local build'})`);
 
   // 根据模式添加架构标志
   // Add arch flags based on mode
@@ -293,7 +460,93 @@ try {
     console.log(`🚀 Creating distributables for ${targetArch}...`);
   }
 
-  buildWithDmgRetry(`npx electron-builder ${builderArgs} ${archFlag} ${publishArg}`, targetArch);
+  // 为 Windows 构建添加架构检测脚本
+  // Add architecture detection scripts for Windows builds
+  // 使用 .onVerifyInstDir 避免与 electron-builder 冲突
+  // Use .onVerifyInstDir to avoid conflicts with electron-builder
+  let nsisInclude = '';
+  if (builderArgs.includes('--win') || builderArgs.includes('--all')) {
+    if (!multiArch) {
+      // 单架构构建：添加对应架构的检测脚本
+      // Single-arch build: Add architecture-specific detection script
+      if (targetArch === 'arm64') {
+        const arm64Script = 'resources/windows-installer-arm64.nsh';
+        if (fs.existsSync(path.resolve(__dirname, '..', arm64Script))) {
+          nsisInclude += ` --config.nsis.include="${arm64Script}"`;
+          console.log(`📋 Including Windows ARM64 architecture check script`);
+        }
+      } else if (targetArch === 'x64') {
+        const x64Script = 'resources/windows-installer-x64.nsh';
+        if (fs.existsSync(path.resolve(__dirname, '..', x64Script))) {
+          nsisInclude += ` --config.nsis.include="${x64Script}"`;
+          console.log(`📋 Including Windows x64 architecture check script`);
+        }
+      }
+    }
+    // 多架构构建：暂不支持架构检测脚本
+    // Multi-arch builds: Architecture detection not supported yet
+  }
+
+  if (process.platform === 'win32' && builderArgs.includes('--win')) {
+    const winUnpackedDir = path.join(outDir, 'win-unpacked');
+    let cleaned = tryRemoveDir(winUnpackedDir);
+    if (!cleaned) {
+      const aionRunning = isProcessRunningWindows('AionUi.exe');
+      const electronRunning = isProcessRunningWindows('electron.exe');
+      if (aionRunning || electronRunning) {
+        console.log('⚠️  Detected running AionUi/Electron process. Attempting to close...');
+        killWindowsProcesses(['AionUi.exe', 'electron.exe']);
+        cleaned = tryRemoveDir(winUnpackedDir);
+        if (!cleaned) {
+          console.log('⚠️  Directory still locked. Please close any running AionUi/Electron processes and retry.');
+        }
+      }
+    }
+  }
+
+  const isWindowsBuild = builderArgs.includes('--win') || builderArgs.includes('--all');
+  if (isWindowsBuild) {
+    cleanupWindowsPackOutput();
+  }
+
+  const builderCommand = `bunx electron-builder ${builderArgs} ${archFlag} ${nsisInclude} ${publishArg}`;
+  try {
+    buildWithDmgRetry(builderCommand, targetArch);
+  } catch (error) {
+    const winExePath = path.join(outDir, 'win-unpacked', 'AionUi.exe');
+    const firstError = formatExecError(error);
+    const canRetryWithoutExecutableEdit = process.platform === 'win32'
+      && isWindowsBuild
+      && process.env.CI !== 'true'
+      && fs.existsSync(winExePath);
+
+    if (!canRetryWithoutExecutableEdit) {
+      throw error;
+    }
+
+    console.log('⚠️  Windows local build failed after AionUi.exe was produced.');
+    if (firstError) {
+      console.log('   First failure summary:');
+      console.log(firstError.split(/\r?\n/).slice(0, 6).map((line) => `   ${line}`).join('\n'));
+    }
+    console.log('   Retrying local build with win.signAndEditExecutable=false...');
+    console.log('   This fallback is intended for transient rcedit / file-lock failures on developer machines.');
+    killWindowsProcesses(['AionUi.exe', 'electron.exe']);
+    cleanupWindowsPackOutput();
+
+    try {
+      buildWithDmgRetry(`${builderCommand} --config.win.signAndEditExecutable=false`, targetArch);
+    } catch (retryError) {
+      const retryFailure = formatExecError(retryError);
+      throw new Error([
+        'Windows local retry with win.signAndEditExecutable=false also failed.',
+        'First failure:',
+        firstError || String(error),
+        'Retry failure:',
+        retryFailure || String(retryError),
+      ].join('\n'));
+    }
+  }
 
   console.log('✅ Build completed!');
 } catch (error) {

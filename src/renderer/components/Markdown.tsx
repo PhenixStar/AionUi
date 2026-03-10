@@ -9,6 +9,7 @@ import ReactMarkdown from 'react-markdown';
 import SyntaxHighlighter from 'react-syntax-highlighter';
 import { vs, vs2015 } from 'react-syntax-highlighter/dist/esm/styles/hljs';
 import rehypeKatex from 'rehype-katex';
+import rehypeRaw from 'rehype-raw';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
@@ -17,8 +18,9 @@ import katex from 'katex';
 // Import KaTeX CSS to make it available in the document
 import 'katex/dist/katex.min.css';
 
-import { ipcBridge } from '@/common';
 import { diffColors } from '@/renderer/theme/colors';
+import { copyText } from '@/renderer/utils/clipboard';
+import { openExternalUrl } from '@/renderer/utils/platform';
 import { Message } from '@arco-design/web-react';
 import { Copy, Down, Up } from '@icon-park/react';
 import { theme } from '@office-ai/platform';
@@ -27,6 +29,7 @@ import React, { useMemo, useState } from 'react';
 import ReactDOM from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { addImportantToAll } from '../utils/customCssProcessor';
+import { convertLatexDelimiters } from '../utils/latexDelimiters';
 import LocalImageView from './LocalImageView';
 
 const formatCode = (code: string) => {
@@ -68,7 +71,7 @@ const getDiffLineStyle = (line: string, isDark: boolean): React.CSSProperties =>
 
 function CodeBlock(props: any) {
   const { t } = useTranslation();
-  const [fold, setFlow] = useState(false);
+  const [fold, setFlow] = useState(true);
   const [currentTheme, setCurrentTheme] = useState<'light' | 'dark'>(() => {
     return (document.documentElement.getAttribute('data-theme') as 'light' | 'dark') || 'light';
   });
@@ -131,12 +134,13 @@ function CodeBlock(props: any) {
     const diffLines = isDiff ? formattedContent.split('\n') : [];
 
     return (
-      <div style={{ width: '100%', ...(props.codeStyle || {}) }}>
+      <div style={{ width: '100%', minWidth: 0, maxWidth: '100%', ...(props.codeStyle || {}) }}>
         <div
           style={{
             border: '1px solid var(--bg-3)',
             borderRadius: '0.3rem',
             overflow: 'hidden',
+            overflowX: 'auto',
           }}
         >
           <div
@@ -171,9 +175,13 @@ function CodeBlock(props: any) {
                 style={{ cursor: 'pointer' }}
                 fill='var(--text-secondary)'
                 onClick={() => {
-                  void navigator.clipboard.writeText(formatCode(children)).then(() => {
-                    Message.success(t('common.copySuccess'));
-                  });
+                  void copyText(formatCode(children))
+                    .then(() => {
+                      Message.success(t('common.copySuccess'));
+                    })
+                    .catch(() => {
+                      Message.error(t('common.copyFailed'));
+                    });
                 }}
               />
               {/* 折叠/展开按钮 / Fold/unfold button */}
@@ -182,36 +190,54 @@ function CodeBlock(props: any) {
           </div>
           {logicRender(
             !fold,
-            <SyntaxHighlighter
-              children={formattedContent}
-              language={language}
-              style={codeTheme}
-              PreTag='div'
-              wrapLines={isDiff}
-              lineProps={
-                isDiff
-                  ? (lineNumber: number) => ({
-                      style: { display: 'block', ...getDiffLineStyle(diffLines[lineNumber - 1] || '', currentTheme === 'dark') },
-                    })
-                  : undefined
-              }
-              customStyle={{
-                marginTop: '0',
-                margin: '0',
-                borderTopLeftRadius: '0',
-                borderTopRightRadius: '0',
-                borderBottomLeftRadius: '0.3rem',
-                borderBottomRightRadius: '0.3rem',
-                border: 'none',
-                background: 'transparent',
-                color: 'var(--text-primary)',
-              }}
-              codeTagProps={{
-                style: {
+            <>
+              <SyntaxHighlighter
+                children={formattedContent}
+                language={language}
+                style={codeTheme}
+                PreTag='div'
+                wrapLines={isDiff}
+                lineProps={
+                  isDiff
+                    ? (lineNumber: number) => ({
+                        style: { display: 'block', ...getDiffLineStyle(diffLines[lineNumber - 1] || '', currentTheme === 'dark') },
+                      })
+                    : undefined
+                }
+                customStyle={{
+                  marginTop: '0',
+                  margin: '0',
+                  borderTopLeftRadius: '0',
+                  borderTopRightRadius: '0',
+                  borderBottomLeftRadius: '0',
+                  borderBottomRightRadius: '0',
+                  border: 'none',
+                  background: 'transparent',
                   color: 'var(--text-primary)',
-                },
-              }}
-            />
+                  overflowX: 'auto',
+                  maxWidth: '100%',
+                }}
+                codeTagProps={{
+                  style: {
+                    color: 'var(--text-primary)',
+                  },
+                }}
+              />
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  alignItems: 'center',
+                  backgroundColor: 'var(--bg-2)',
+                  borderBottomLeftRadius: '0.3rem',
+                  borderBottomRightRadius: '0.3rem',
+                  padding: '6px 10px',
+                  borderTop: '1px solid var(--bg-3)',
+                }}
+              >
+                <Up theme='outline' size='20' style={{ cursor: 'pointer' }} fill='var(--text-secondary)' onClick={() => setFlow(true)} title={t('common.collapse', '收起')} />
+              </div>
+            </>
           )}
         </div>
       </div>
@@ -244,6 +270,7 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
     word-break: break-word;
     overflow-wrap: anywhere;
     color: var(--text-primary);
+    max-width: 100%;
   }
   .markdown-shadow-body>p:first-child
   {
@@ -275,12 +302,16 @@ const createInitStyle = (currentTheme = 'light', cssVars?: Record<string, string
   code{
     font-size:14px;
   }
- 
+
   .markdown-shadow-body>p:last-child{
     margin-bottom:0px;
   }
-  ol {
+  ol, ul {
     padding-inline-start:20px;
+  }
+  pre {
+    max-width: 100%;
+    overflow-x: auto;
   }
   img {
     max-width: 100%;
@@ -505,14 +536,18 @@ interface MarkdownViewProps {
   codeStyle?: React.CSSProperties;
   className?: string;
   onRef?: (el?: HTMLDivElement | null) => void;
+  /** Enable raw HTML rendering in markdown content. Use with caution — only for trusted sources. */
+  allowHtml?: boolean;
 }
 
-const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeStyle, className, onRef, children: childrenProp }) => {
+const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeStyle, className, onRef, allowHtml, children: childrenProp }) => {
   const { t } = useTranslation();
 
   const normalizedChildren = useMemo(() => {
     if (typeof childrenProp === 'string') {
-      return childrenProp.replace(/file:\/\//g, '');
+      let text = childrenProp.replace(/file:\/\//g, '');
+      text = convertLatexDelimiters(text);
+      return text;
     }
     return childrenProp;
   }, [childrenProp]);
@@ -533,7 +568,7 @@ const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeS
         <div ref={onRef} className='markdown-shadow-body'>
           <ReactMarkdown
             remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
-            rehypePlugins={[rehypeKatex]}
+            rehypePlugins={allowHtml ? [rehypeRaw, rehypeKatex] : [rehypeKatex]}
             components={{
               span: ({ node: _node, className, children, ...props }) => {
                 return (
@@ -552,13 +587,9 @@ const MarkdownView: React.FC<MarkdownViewProps> = ({ hiddenCodeCopyButton, codeS
                     e.preventDefault();
                     e.stopPropagation();
                     if (!props.href) return;
-                    try {
-                      ipcBridge.shell.openExternal.invoke(props.href).catch((error) => {
-                        console.error(t('messages.openLinkFailed'), error);
-                      });
-                    } catch (error) {
+                    openExternalUrl(props.href).catch((error) => {
                       console.error(t('messages.openLinkFailed'), error);
-                    }
+                    });
                   }}
                 />
               ),

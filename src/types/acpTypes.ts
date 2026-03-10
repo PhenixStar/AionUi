@@ -18,7 +18,7 @@
  * 预设助手的主 Agent 类型，用于决定创建哪种类型的对话
  * The primary agent type for preset assistants, used to determine which conversation type to create.
  */
-export type PresetAgentType = 'gemini' | 'claude' | 'codex' | 'codebuddy' | 'opencode';
+export type PresetAgentType = 'gemini' | 'claude' | 'codex' | 'codebuddy' | 'opencode' | 'qwen';
 
 /**
  * 使用 ACP 协议的预设 Agent 类型（需要通过 ACP 后端路由）
@@ -27,7 +27,13 @@ export type PresetAgentType = 'gemini' | 'claude' | 'codex' | 'codebuddy' | 'ope
  * 这些类型会在创建对话时使用对应的 ACP 后端，而不是 Gemini 原生对话
  * These types will use corresponding ACP backend when creating conversation, instead of native Gemini
  */
-export const ACP_ROUTED_PRESET_TYPES: readonly PresetAgentType[] = ['claude', 'codebuddy', 'opencode'] as const;
+export const ACP_ROUTED_PRESET_TYPES: readonly PresetAgentType[] = ['claude', 'codebuddy', 'opencode', 'codex', 'qwen'] as const;
+
+export const CODEX_ACP_BRIDGE_VERSION = '0.9.5';
+export const CODEX_ACP_NPX_PACKAGE = `@zed-industries/codex-acp@${CODEX_ACP_BRIDGE_VERSION}`;
+
+export const CLAUDE_ACP_BRIDGE_VERSION = '0.18.0';
+export const CLAUDE_ACP_NPX_PACKAGE = `@zed-industries/claude-agent-acp@${CLAUDE_ACP_BRIDGE_VERSION}`;
 
 /**
  * 检查预设 Agent 类型是否需要通过 ACP 后端路由
@@ -43,7 +49,7 @@ export type AcpBackendAll =
   | 'gemini' // Google Gemini ACP
   | 'qwen' // Qwen Code ACP
   | 'iflow' // iFlow CLI ACP
-  | 'codex' // OpenAI Codex MCP
+  | 'codex' // OpenAI Codex ACP (via codex-acp bridge)
   | 'codebuddy' // Tencent CodeBuddy Code CLI
   | 'droid' // Factory Droid CLI (ACP via `droid exec --output-format acp`)
   | 'goose' // Block's Goose CLI
@@ -204,6 +210,23 @@ export interface AcpBackendConfig {
   env?: Record<string, string>;
 
   /**
+   * 扩展声明的 API Key 字段列表
+   * 用户可在 Settings UI 中配置这些值，配置后作为环境变量注入到子进程
+   *
+   * API Key fields declared by extensions for user configuration in Settings UI.
+   * User-entered values are injected as environment variables when spawning the process.
+   * Example: [{ key: "MY_API_KEY", label: "API Key", type: "password", required: true }]
+   */
+  apiKeyFields?: Array<{
+    key: string;
+    label: string;
+    type: 'text' | 'password' | 'select' | 'number' | 'boolean';
+    required?: boolean;
+    options?: string[];
+    default?: string | number | boolean;
+  }>;
+
+  /**
    * 启用 ACP 模式时的参数
    * 不同 CLI 使用不同约定：
    *   - ['--experimental-acp'] 用于 claude（未指定时的默认值）
@@ -240,6 +263,7 @@ export interface AcpBackendConfig {
    * - 'gemini': 创建 Gemini 对话
    * - 'claude': 创建使用 Claude 后端的 ACP 对话
    * - 'codex': 创建 Codex 对话
+   * - 任意字符串: 扩展贡献的 ACP 适配器 ID（如 'ext-buddy'）
    * 为向后兼容默认为 'gemini'
    *
    * The primary agent type for this preset (only applies when isPreset=true).
@@ -247,9 +271,10 @@ export interface AcpBackendConfig {
    * - 'gemini': Creates a Gemini conversation
    * - 'claude': Creates an ACP conversation with Claude backend
    * - 'codex': Creates a Codex conversation
+   * - any string: Extension-contributed ACP adapter ID (e.g. 'ext-buddy')
    * Defaults to 'gemini' for backward compatibility.
    */
-  presetAgentType?: PresetAgentType;
+  presetAgentType?: PresetAgentType | string;
 
   /**
    * 此助手可用的模型列表（仅 isPreset=true 时生效）
@@ -320,11 +345,13 @@ export const ACP_BACKENDS_ALL: Record<AcpBackendAll, AcpBackendConfig> = {
   },
   codex: {
     id: 'codex',
-    name: 'Codex ',
-    cliCommand: 'codex',
-    authRequired: false,
-    enabled: true, // ✅ 已验证支持：Codex CLI v0.4.0+ 支持 acp 模式
+    name: 'Codex',
+    cliCommand: 'codex', // Detect local codex CLI (codex-acp bridge invokes it)
+    defaultCliPath: `npx ${CODEX_ACP_NPX_PACKAGE}`,
+    authRequired: true, // Needs OPENAI_API_KEY or ChatGPT auth
+    enabled: true, // ✅ Codex via codex-acp ACP bridge
     supportsStreaming: false,
+    acpArgs: [], // codex-acp is ACP by default, no flag needed
   },
   codebuddy: {
     id: 'codebuddy',
@@ -599,6 +626,9 @@ export interface ToolCallUpdateStatus extends BaseSessionUpdate {
     sessionUpdate: 'tool_call_update';
     toolCallId: string;
     status: 'completed' | 'failed';
+    // rawInput may arrive in tool_call_update with complete data (after streaming completes)
+    // This happens when input_json_delta finishes and the full input is available
+    rawInput?: Record<string, unknown>;
     content?: Array<{
       type: 'content';
       content: {
@@ -649,8 +679,71 @@ export interface UserMessageChunkUpdate extends BaseSessionUpdate {
   };
 }
 
+// ===== ACP ConfigOption types (stable API) =====
+
+/** A single select option within a config option */
+export interface AcpConfigSelectOption {
+  value: string;
+  name?: string;
+  label?: string; // Some agents may use label instead of name
+}
+
+/** A configuration option returned by session/new */
+export interface AcpSessionConfigOption {
+  id: string;
+  name?: string;
+  label?: string; // Some agents may use label instead of name
+  description?: string;
+  category?: string;
+  type: 'select' | 'boolean' | 'string';
+  currentValue?: string;
+  selectedValue?: string; // Some agents may use selectedValue instead of currentValue
+  options?: AcpConfigSelectOption[];
+}
+
+/** Config options update notification (within session/update) */
+export interface ConfigOptionsUpdatePayload extends BaseSessionUpdate {
+  update: {
+    sessionUpdate: 'config_option_update';
+    configOptions: AcpSessionConfigOption[];
+  };
+}
+
+// ===== ACP Models types (unstable API) =====
+
+/** An available model returned by session/new (unstable API) */
+export interface AcpAvailableModel {
+  id?: string;
+  modelId?: string; // OpenCode uses modelId instead of id
+  name?: string;
+}
+
+/** Models info returned by session/new (unstable API) */
+export interface AcpSessionModels {
+  currentModelId?: string;
+  availableModels?: AcpAvailableModel[];
+}
+
+// ===== Unified model info for UI =====
+
+/** Unified model info that abstracts over both stable and unstable APIs */
+export interface AcpModelInfo {
+  /** Currently active model ID */
+  currentModelId: string | null;
+  /** Display label for the current model */
+  currentModelLabel: string | null;
+  /** Available models for switching */
+  availableModels: Array<{ id: string; label: string }>;
+  /** Whether the user can switch models */
+  canSwitch: boolean;
+  /** Source of the model info: 'configOption' (stable) or 'models' (unstable) */
+  source: 'configOption' | 'models';
+  /** Config option ID (only when source is 'configOption') */
+  configOptionId?: string;
+}
+
 // 所有会话更新的联合类型 / Union type for all session updates
-export type AcpSessionUpdate = AgentMessageChunkUpdate | AgentThoughtChunkUpdate | ToolCallUpdate | ToolCallUpdateStatus | PlanUpdate | AvailableCommandsUpdate | UserMessageChunkUpdate;
+export type AcpSessionUpdate = AgentMessageChunkUpdate | AgentThoughtChunkUpdate | ToolCallUpdate | ToolCallUpdateStatus | PlanUpdate | AvailableCommandsUpdate | UserMessageChunkUpdate | ConfigOptionsUpdatePayload;
 
 // 当前的 ACP 权限请求接口 / Current ACP permission request interface
 export interface AcpPermissionOption {
@@ -730,6 +823,7 @@ export const ACP_METHODS = {
   REQUEST_PERMISSION: 'session/request_permission',
   READ_TEXT_FILE: 'fs/read_text_file',
   WRITE_TEXT_FILE: 'fs/write_text_file',
+  SET_CONFIG_OPTION: 'session/set_config_option',
 } as const;
 
 export type AcpMethod = (typeof ACP_METHODS)[keyof typeof ACP_METHODS];

@@ -105,36 +105,77 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
       }),
       ipcBridge.conversation.confirmation.update.on(({ ...data }) => {
         if (conversation_id !== data.conversation_id) return;
-        setConfirmations((list) => {
-          const original = list.find((p) => p.id === data.id);
-          if (original) {
-            Object.assign(original, data);
-          }
-          return list.slice();
-        });
+        setConfirmations((list) => list.map((p) => (p.id === data.id ? { ...p, ...data } : p)));
       })
     );
   }, [conversation_id, checkAndAutoConfirm]);
 
-  // Handle ESC key to cancel confirmation
+  // Handle keyboard shortcuts for confirmation actions
+  // 处理确认操作的键盘快捷键
   useEffect(() => {
     if (!confirmations.length) return;
 
     const confirmation = confirmations[0];
+
+    const confirmOption = (option: (typeof confirmation.options)[number]) => {
+      setConfirmations((prev) => prev.filter((p) => p.id !== confirmation.id));
+      void ipcBridge.conversation.confirmation.confirm.invoke({
+        conversation_id,
+        callId: confirmation.callId,
+        msg_id: confirmation.id,
+        data: option.value,
+      });
+    };
+
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        // Find cancel option (value is 'cancel')
-        const cancelOption = confirmation.options.find((opt) => opt.value === 'cancel');
-        if (cancelOption) {
+      // Skip if user is typing in an input
+      const target = event.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable) return;
+
+      const options = confirmation.options;
+
+      // Enter → first option (typically Allow)
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        if (options[0]) confirmOption(options[0]);
+        return;
+      }
+
+      // Escape / N → cancel
+      if (event.key === 'Escape' || event.key.toLowerCase() === 'n') {
+        const cancelOpt = options.find((opt) => opt.value === 'cancel');
+        if (cancelOpt) {
           event.preventDefault();
-          setConfirmations((prev) => prev.filter((p) => p.id !== confirmation.id));
-          void ipcBridge.conversation.confirmation.confirm.invoke({
-            conversation_id,
-            callId: confirmation.callId,
-            msg_id: confirmation.id,
-            data: cancelOption.value,
-          });
+          confirmOption(cancelOpt);
         }
+        return;
+      }
+
+      // Y → proceed_once (Allow)
+      if (event.key.toLowerCase() === 'y') {
+        const allowOpt = options.find((opt) => opt.value === 'proceed_once');
+        if (allowOpt) {
+          event.preventDefault();
+          confirmOption(allowOpt);
+        }
+        return;
+      }
+
+      // A → proceed_always (Always Allow)
+      if (event.key.toLowerCase() === 'a') {
+        const alwaysOpt = options.find((opt) => opt.value === 'proceed_always');
+        if (alwaysOpt) {
+          event.preventDefault();
+          confirmOption(alwaysOpt);
+        }
+        return;
+      }
+
+      // Number keys 1-9 → select by index
+      const num = parseInt(event.key, 10);
+      if (num >= 1 && num <= options.length) {
+        event.preventDefault();
+        confirmOption(options[num - 1]);
       }
     };
 
@@ -156,7 +197,7 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
           }}
         >
           {/* 错误标题 / Error title */}
-          <div className='color-[rgba(217,45,32,1)] text-14px font-medium mb-8px'>{t('conversation.confirmationLoadError', 'Failed to load confirmation dialog')}</div>
+          <div className='color-[rgba(217,45,32,1)] text-14px font-medium mb-8px'>{t('conversation.chat.confirmationLoadError', 'Failed to load confirmation dialog')}</div>
           {/* 错误详情 / Error details */}
           <div className='text-12px color-[rgba(134,144,156,1)] mb-12px'>{loadError}</div>
           {/* 手动重试按钮 / Manual retry button */}
@@ -194,9 +235,11 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
             boxShadow: '0px 2px 20px 0px rgba(74, 88, 250, 0.1)',
           }}
         >
-          <div className='color-[rgba(29,33,41,1)] text-16px font-bold shrink-0'>{$t(confirmation.title) || 'Choose an action'}:</div>
-          <Divider className={'!my-10px shrink-0'}></Divider>
           <div className='flex-1 overflow-y-auto min-h-0'>
+            <Typography.Ellipsis className='text-16px font-bold color-[rgba(29,33,41,1)]' rows={2} expandable>
+              {$t(confirmation.title) || 'Choose an action'}
+            </Typography.Ellipsis>
+            <Divider className={'!my-10px'}></Divider>
             <Typography.Ellipsis className='text-14px color-[rgba(29,33,41,1)]' rows={5} expandable>
               {$t(confirmation.description)}
             </Typography.Ellipsis>
@@ -204,6 +247,8 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
           <div className='shrink-0'>
             {confirmation.options.map((option, index) => {
               const label = $t(option.label, option.params);
+              // Determine shortcut hint for this option
+              const shortcut = index === 0 ? 'Enter' : option.value === 'cancel' ? 'Esc' : option.value === 'proceed_always' ? 'A' : option.value === 'proceed_once' ? 'Y' : String(index + 1);
               return (
                 <div
                   onClick={() => {
@@ -213,8 +258,9 @@ const ConversationChatConfirm: React.FC<PropsWithChildren<{ conversation_id: str
                     void ipcBridge.conversation.confirmation.confirm.invoke({ conversation_id, callId: confirmation.callId, msg_id: confirmation.id, data: option.value });
                   }}
                   key={label + option.value + index}
-                  className='b-1px b-solid h-30px lh-30px b-[rgba(229,230,235,1)] rd-8px px-12px hover:bg-[rgba(229,231,240,1)] cursor-pointer mt-10px'
+                  className='b-1px b-solid h-30px lh-30px b-[rgba(229,230,235,1)] rd-8px px-12px hover:bg-[rgba(229,231,240,1)] cursor-pointer mt-10px flex items-center gap-8px'
                 >
+                  <span className='inline-flex items-center justify-center px-4px h-18px rd-4px bg-[rgba(229,230,235,0.6)] text-11px text-[rgba(134,144,156,1)] font-mono shrink-0'>{shortcut}</span>
                   {label}
                 </div>
               );
