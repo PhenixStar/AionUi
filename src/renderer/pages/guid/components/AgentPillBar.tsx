@@ -4,12 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { getAgentLogo } from '@/renderer/utils/agentLogo';
+import { getAgentLogo } from '@/renderer/utils/model/agentLogo';
 import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
-import { useLayoutContext } from '@/renderer/context/LayoutContext';
+import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import type { AcpBackend, AvailableAgent } from '../types';
-import { Robot } from '@icon-park/react';
+import { Plus, Robot } from '@icon-park/react';
+import { Tooltip } from '@arco-design/web-react';
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import styles from '../index.module.css';
 
 type AgentPillBarProps = {
@@ -19,9 +22,16 @@ type AgentPillBarProps = {
   onSelectAgent: (key: string) => void;
 };
 
-const AgentPillBar: React.FC<AgentPillBarProps> = ({ availableAgents, selectedAgentKey, getAgentKey, onSelectAgent }) => {
+const AgentPillBar: React.FC<AgentPillBarProps> = ({
+  availableAgents,
+  selectedAgentKey,
+  getAgentKey,
+  onSelectAgent,
+}) => {
   const layout = useLayoutContext();
   const isMobile = layout?.isMobile ?? false;
+  const navigate = useNavigate();
+  const { t } = useTranslation();
 
   return (
     <div className='w-full flex justify-center'>
@@ -48,18 +58,50 @@ const AgentPillBar: React.FC<AgentPillBarProps> = ({ availableAgents, selectedAg
           .map((agent, index) => {
             const isSelected = selectedAgentKey === getAgentKey(agent);
             const extensionAvatar = resolveExtensionAssetUrl(agent.isExtension ? agent.avatar : undefined);
-            const logoSrc = extensionAvatar || getAgentLogo(agent.backend);
+            // Remote agents use emoji avatars — not image URLs
+            const emojiAvatar = agent.backend === 'remote' && agent.avatar ? agent.avatar : undefined;
+            const logoSrc = extensionAvatar || (!emojiAvatar ? getAgentLogo(agent.backend) : undefined);
 
             return (
               <React.Fragment key={getAgentKey(agent)}>
                 {!isMobile && index > 0 && <div className='text-16px lh-1 p-2px select-none opacity-30'>|</div>}
-                <div data-agent-pill='true' data-agent-key={getAgentKey(agent)} data-agent-backend={agent.backend} data-agent-selected={isSelected ? 'true' : 'false'} className={`group relative flex items-center cursor-pointer whitespace-nowrap overflow-hidden ${isSelected ? `opacity-100 px-12px py-8px rd-20px mx-2px ${styles.agentItemSelected}` : isMobile ? 'opacity-70 p-4px' : 'opacity-60 p-4px hover:opacity-100'}`} style={isSelected ? (isMobile ? { animation: 'none', transition: 'opacity 0.2s ease, background-color 0.2s ease' } : undefined) : { transition: 'opacity 0.2s ease' }} onClick={() => onSelectAgent(getAgentKey(agent))}>
-                  {logoSrc ? <img src={logoSrc} alt={`${agent.backend} logo`} width={20} height={20} style={{ objectFit: 'contain', flexShrink: 0 }} /> : <Robot theme='outline' size={20} fill='currentColor' style={{ flexShrink: 0 }} />}
+                <div
+                  data-agent-pill='true'
+                  data-agent-key={getAgentKey(agent)}
+                  data-agent-backend={agent.backend}
+                  data-agent-selected={isSelected ? 'true' : 'false'}
+                  className={`group relative flex items-center cursor-pointer whitespace-nowrap overflow-hidden ${isSelected ? `opacity-100 px-12px py-8px rd-20px mx-2px ${styles.agentItemSelected}` : isMobile ? 'opacity-70 p-4px' : 'opacity-60 p-4px hover:opacity-100'}`}
+                  style={
+                    isSelected
+                      ? isMobile
+                        ? { animation: 'none', transition: 'opacity 0.2s ease, background-color 0.2s ease' }
+                        : undefined
+                      : { transition: 'opacity 0.2s ease' }
+                  }
+                  onClick={() => onSelectAgent(getAgentKey(agent))}
+                >
+                  {emojiAvatar ? (
+                    <span style={{ fontSize: 20, lineHeight: 1, flexShrink: 0 }}>{emojiAvatar}</span>
+                  ) : logoSrc ? (
+                    <img
+                      src={logoSrc}
+                      alt={`${agent.backend} logo`}
+                      width={20}
+                      height={20}
+                      style={{ objectFit: 'contain', flexShrink: 0 }}
+                    />
+                  ) : (
+                    <Robot theme='outline' size={20} fill='currentColor' style={{ flexShrink: 0 }} />
+                  )}
                   <span
                     className={`font-medium text-14px ${isSelected ? 'font-semibold ml-4px' : isMobile ? 'max-w-0 opacity-0 overflow-hidden' : 'max-w-0 opacity-0 overflow-hidden group-hover:max-w-100px group-hover:opacity-100 group-hover:ml-8px'}`}
                     style={{
                       color: 'var(--text-primary)',
-                      transition: isSelected ? 'color 0.2s ease, font-weight 0.2s ease' : isMobile ? 'none' : 'max-width 0.6s cubic-bezier(0.2, 0.8, 0.3, 1), opacity 0.5s cubic-bezier(0.2, 0.8, 0.3, 1) 0.05s, margin 0.6s cubic-bezier(0.2, 0.8, 0.3, 1)',
+                      transition: isSelected
+                        ? 'color 0.2s ease, font-weight 0.2s ease'
+                        : isMobile
+                          ? 'none'
+                          : 'max-width 0.6s cubic-bezier(0.2, 0.8, 0.3, 1), opacity 0.5s cubic-bezier(0.2, 0.8, 0.3, 1) 0.05s, margin 0.6s cubic-bezier(0.2, 0.8, 0.3, 1)',
                     }}
                   >
                     {agent.name}
@@ -68,6 +110,16 @@ const AgentPillBar: React.FC<AgentPillBarProps> = ({ availableAgents, selectedAg
               </React.Fragment>
             );
           })}
+        {!isMobile && <div className='text-16px lh-1 p-2px select-none opacity-30'>|</div>}
+        <Tooltip content={t('settings.agentManagement.connectRemoteAgent')}>
+          <div
+            className='flex items-center justify-center cursor-pointer p-4px opacity-60 hover:opacity-100 self-center'
+            style={{ transition: 'opacity 0.2s ease', flexShrink: 0, marginTop: 2 }}
+            onClick={() => navigate('/settings/agent')}
+          >
+            <Plus theme='outline' size={20} fill='currentColor' style={{ flexShrink: 0 }} />
+          </div>
+        </Tooltip>
       </div>
     </div>
   );

@@ -4,47 +4,69 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type { BrowserWindow } from 'electron';
 import { app } from 'electron';
-import { ipcBridge } from '../../common';
-import { getSystemDir, ProcessEnv } from '../initStorage';
-import { copyDirectoryRecursively } from '../utils';
-import WorkerManage from '../WorkerManage';
-import { getZoomFactor, setZoomFactor } from '../utils/zoom';
-import { getCdpStatus, updateCdpConfig, verifyCdpReady } from '../../utils/configureChromium';
+import { ipcBridge } from '@/common';
+import type { IWorkerTaskManager } from '@process/task/IWorkerTaskManager';
+import { getZoomFactor, setZoomFactor } from '@process/utils/zoom';
+import { getCdpStatus, updateCdpConfig } from '@process/utils/configureChromium';
+import { initApplicationBridgeCore } from './applicationBridgeCore';
 
-export function initApplicationBridge(): void {
+let mainWindowRef: BrowserWindow | null = null;
+
+export function setApplicationMainWindow(win: BrowserWindow): void {
+  mainWindowRef = win;
+}
+
+export function initApplicationBridge(workerTaskManager: IWorkerTaskManager): void {
+  // Platform-agnostic handlers: systemInfo, updateSystemInfo, getPath
+  initApplicationBridgeCore();
+
   ipcBridge.application.restart.provider(() => {
     // 清理所有工作进程
-    WorkerManage.clear();
+    workerTaskManager.clear();
     // 重启应用 - 使用标准的 Electron 重启方式
     app.relaunch();
     app.exit(0);
     return Promise.resolve();
   });
 
-  ipcBridge.application.updateSystemInfo.provider(async ({ cacheDir, workDir }) => {
-    try {
-      const oldDir = getSystemDir();
-      if (oldDir.cacheDir !== cacheDir) {
-        await copyDirectoryRecursively(oldDir.cacheDir, cacheDir);
-      }
-      await ProcessEnv.set('aionui.dir', { cacheDir, workDir });
-      return { success: true };
-    } catch (e) {
-      return { success: false, msg: e.message || e.toString() };
+  ipcBridge.application.isDevToolsOpened.provider(() => {
+    if (mainWindowRef && !mainWindowRef.isDestroyed()) {
+      return Promise.resolve(mainWindowRef.webContents.isDevToolsOpened());
     }
-  });
-
-  ipcBridge.application.systemInfo.provider(() => {
-    return Promise.resolve(getSystemDir());
-  });
-
-  ipcBridge.application.getPath.provider(({ name }) => {
-    return Promise.resolve(app.getPath(name));
+    return Promise.resolve(false);
   });
 
   ipcBridge.application.openDevTools.provider(() => {
-    // This will be handled by the main window when needed
+    if (mainWindowRef && !mainWindowRef.isDestroyed()) {
+      const win = mainWindowRef;
+      const wasOpen = win.webContents.isDevToolsOpened();
+
+      if (wasOpen) {
+        win.webContents.closeDevTools();
+        return Promise.resolve(false);
+      } else {
+        return new Promise((resolve) => {
+          const onOpened = () => {
+            win.webContents.off('devtools-opened', onOpened);
+            resolve(true);
+          };
+
+          win.webContents.once('devtools-opened', onOpened);
+          win.webContents.openDevTools();
+
+          setTimeout(() => {
+            win.webContents.off('devtools-opened', onOpened);
+            if (win.isDestroyed()) {
+              resolve(false);
+              return;
+            }
+            resolve(win.webContents.isDevToolsOpened());
+          }, 500);
+        });
+      }
+    }
     return Promise.resolve(false);
   });
 

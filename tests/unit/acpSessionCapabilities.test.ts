@@ -5,9 +5,20 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AcpConnection } from '../../src/agent/acp/AcpConnection';
-import { AcpAgent } from '../../src/agent/acp/index';
+import { AcpConnection } from '../../src/process/agent/acp/AcpConnection';
+import { AcpAgent } from '../../src/process/agent/acp/index';
 import type { AcpSessionConfigOption, AcpSessionModels } from '../../src/types/acpTypes';
+
+vi.mock('@process/utils/initStorage', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@process/utils/initStorage')>();
+  return {
+    ...actual,
+    ProcessConfig: {
+      ...actual.ProcessConfig,
+      get: vi.fn().mockResolvedValue([]),
+    },
+  };
+});
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -31,7 +42,9 @@ function makeAgent(backend: string, acpSessionId?: string): AcpAgent {
   });
 }
 
-const CONFIG_OPTIONS: AcpSessionConfigOption[] = [{ id: 'model', category: 'model', type: 'select', currentValue: 'gpt-4o', options: [] }];
+const CONFIG_OPTIONS: AcpSessionConfigOption[] = [
+  { id: 'model', category: 'model', type: 'select', currentValue: 'gpt-4o', options: [] },
+];
 const MODELS: AcpSessionModels = {
   currentModelId: 'gpt-4o',
   availableModels: [{ id: 'gpt-4o' }, { id: 'o3' }],
@@ -168,7 +181,7 @@ describe('AcpAgent.createOrResumeSession — Codex routing', () => {
 
     await (agent as any).createOrResumeSession();
 
-    expect(newSession).toHaveBeenCalledWith(expect.any(String));
+    expect(newSession).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ mcpServers: [] }));
   });
 
   it('creates a fresh session when no acpSessionId is stored', async () => {
@@ -181,7 +194,7 @@ describe('AcpAgent.createOrResumeSession — Codex routing', () => {
     await (agent as any).createOrResumeSession();
 
     expect(loadSession).not.toHaveBeenCalled();
-    expect(newSession).toHaveBeenCalledWith(expect.any(String));
+    expect(newSession).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ mcpServers: [] }));
   });
 
   it('updates acpSessionId when resume returns a new session ID', async () => {
